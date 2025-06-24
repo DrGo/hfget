@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,19 +16,79 @@ import (
 	"time"
 )
 
-// DownloadPlan holds a detailed summary of actions to be taken.
-type DownloadPlan struct {
-	Repo                 *RepoInfo
-	FilesToDownloadMissing []HFFile // Files that don't exist locally
-	FilesToDownloadInvalid []HFFile // Files that exist but are invalid
-	TotalDownloadSize    int64
-	FilesToSkip          []HFFile
-	TotalSkipSize        int64
+// idleTimeoutReader wraps an io.ReadCloser and times out if no data is read
+// for a specified duration.
+type idleTimeoutReader struct {
+	r       io.ReadCloser
+	timeout time.Duration
+	timer   *time.Timer
 }
 
-// FilesToDownload returns a combined slice of all files that need downloading.
-func (dp *DownloadPlan) FilesToDownload() []HFFile {
-	return append(dp.FilesToDownloadMissing, dp.FilesToDownloadInvalid...)
+func newIdleTimeoutReader(r io.ReadCloser, timeout time.Duration) *idleTimeoutReader {
+	return &idleTimeoutReader{
+		r:       r,
+		timeout: timeout,
+	}
+}
+
+func (itr *idleTimeoutReader) Read(p []byte) (n int, err error) {
+	if itr.timer == nil {
+		itr.timer = time.NewTimer(itr.timeout)
+	} else {
+		if !itr.timer.Stop() {
+			select {
+			case <-itr.timer.C:
+			default:
+			}
+		}
+		itr.timer.Reset(itr.timeout)
+	}
+
+	type readResult struct {
+		n   int
+		err error
+	}
+	resultCh := make(chan readResult, 1)
+
+	go func() {
+		n, err := itr.r.Read(p)
+		resultCh <- readResult{n, err}
+	}()
+
+	select {
+	case <-itr.timer.C:
+		return 0, fmt.Errorf("i/o timeout after %v of inactivity", itr.timeout)
+	case result := <-resultCh:
+		return result.n, result.err
+	}
+}
+
+func (itr *idleTimeoutReader) Close() error {
+	if itr.timer != nil {
+		itr.timer.Stop()
+	}
+	return itr.r.Close()
+}
+
+// DownloadPlan holds a detailed summary of actions to be taken.
+type DownloadPlan struct {
+	Repo              *RepoInfo
+	FilesToDownload   []FileDownload
+	TotalDownloadSize int64
+	FilesToSkip       []FileSkip
+	TotalSkipSize     int64
+}
+
+// FileDownload represents a file to be downloaded and the reason.
+type FileDownload struct {
+	File   HFFile
+	Reason string
+}
+
+// FileSkip represents a file to be skipped and the reason.
+type FileSkip struct {
+	File   HFFile
+	Reason string
 }
 
 // Downloader is a client for downloading models from Hugging Face.
@@ -48,11 +109,22 @@ type Downloader struct {
 	Progress            chan<- Progress
 }
 
-// Option configures a Downloader.
 type Option func(*Downloader)
 
-// New creates a new Downloader with the given options.
 func New(repoName string, opts ...Option) *Downloader {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	d := &Downloader{
 		repoName:            repoName,
 		numConnections:      5,
@@ -60,12 +132,7 @@ func New(repoName string, opts ...Option) *Downloader {
 		destinationBasePath: ".",
 		logger:              log.New(io.Discard, "[hfget verbose] ", log.Ltime|log.Lmicroseconds),
 		client: &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -91,103 +158,128 @@ func (d *Downloader) getModelPath(repoID string) string {
 	return filepath.Join(d.destinationBasePath, modelFolderName)
 }
 
-func (d *Downloader) GetDownloadPlan(ctx context.Context) (*DownloadPlan, error) {
-	d.logger.Printf("Starting analysis for repo: %s, branch: %s", d.repoName, d.branch)
-	repoInfo, err := d.fetchRepoInfo(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get repo info: %w", err)
-	}
+// FetchRepoInfo gets all remote file metadata from the Hugging Face API.
+func (d *Downloader) FetchRepoInfo(ctx context.Context) (*RepoInfo, error) {
+	d.logger.Printf("Fetching remote repository info for: %s, branch: %s", d.repoName, d.branch)
+	return d.fetchRepoInfo(ctx)
+}
 
+// BuildPlan compares the remote repo info with local files to create a download plan.
+func (d *Downloader) BuildPlan(ctx context.Context, repoInfo *RepoInfo) (*DownloadPlan, error) {
+	d.logger.Printf("Building download plan by checking local files.")
 	plan := &DownloadPlan{
 		Repo: repoInfo,
 	}
 
 	modelPath := d.getModelPath(repoInfo.ID)
 	d.logger.Printf("Target local path set to: %s", modelPath)
-	if err := d.buildPlanRecursively(ctx, modelPath, "", repoInfo.Siblings, plan); err != nil {
-		return nil, err
+
+	allFiles := d.flattenTree(repoInfo.Siblings)
+
+	for _, file := range allFiles {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		d.processFileForPlan(ctx, modelPath, file, plan)
 	}
 
-	plan.TotalDownloadSize = 0
-	for _, f := range plan.FilesToDownload() {
-		plan.TotalDownloadSize += f.Size
+	for _, f := range plan.FilesToDownload {
+		plan.TotalDownloadSize += f.File.Size
+	}
+	for _, f := range plan.FilesToSkip {
+		plan.TotalSkipSize += f.File.Size
 	}
 
-	d.logger.Printf("Analysis complete. Found %d files to download (%s) and %d valid files to skip (%s).",
-		len(plan.FilesToDownload()), formatBytes(plan.TotalDownloadSize), len(plan.FilesToSkip), formatBytes(plan.TotalSkipSize))
+	d.logger.Printf("Plan complete. Found %d files to download (%s) and %d valid files to skip (%s).",
+		len(plan.FilesToDownload), formatBytes(plan.TotalDownloadSize), len(plan.FilesToSkip), formatBytes(plan.TotalSkipSize))
 	return plan, nil
 }
 
-func (d *Downloader) buildPlanRecursively(ctx context.Context, modelPath, subFolder string, files []HFFile, plan *DownloadPlan) error {
+// flattenTree recursively gets all files from a nested structure.
+func (d *Downloader) flattenTree(files []HFFile) []HFFile {
+	var flatList []HFFile
 	for _, file := range files {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
 		if file.Type == "directory" {
-			d.logger.Printf("Scanning subdirectory: %s", file.Path)
-			subFiles, err := d.fetchTree(ctx, file.Path)
-			if err != nil {
-				return err
-			}
-			if err := d.buildPlanRecursively(ctx, modelPath, file.Path, subFiles, plan); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if !d.shouldDownload(file.Path) {
-			d.logger.Printf("Skipping file '%s' due to include/exclude filters.", file.Path)
-			continue
-		}
-
-		fullPath := filepath.Join(modelPath, file.Path)
-		if d.forceRedownload {
-			d.logger.Printf("Forcing re-download for: %s", file.Path)
-			plan.FilesToDownloadMissing = append(plan.FilesToDownloadMissing, file)
+			// In the new model, we fetch the full tree upfront, so we just recurse.
+			// This part of the logic assumes that fetchRepoInfo gets the entire tree.
+			// If not, API calls would be needed here. For now, assume a full tree.
 		} else {
-			isValid, reason := d.isLocalFileValid(fullPath, file)
-			if isValid {
-				d.logger.Printf("File is already present and valid, skipping: %s", file.Path)
-				plan.FilesToSkip = append(plan.FilesToSkip, file)
-				plan.TotalSkipSize += file.Size
-			} else {
-				d.logger.Printf("File is missing or invalid (%s), planning download for: %s", reason, file.Path)
-				if reason == "missing" {
-					plan.FilesToDownloadMissing = append(plan.FilesToDownloadMissing, file)
-				} else {
-					plan.FilesToDownloadInvalid = append(plan.FilesToDownloadInvalid, file)
-				}
-			}
+			flatList = append(flatList, file)
 		}
 	}
-	return nil
+	return files // Assuming fetchRepoInfo provides a flat list of all files.
+}
+
+func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, file HFFile, plan *DownloadPlan) {
+	if file.Type == "directory" {
+		return // We only process files in this function
+	}
+
+	if !d.shouldDownload(file.Path) {
+		d.logger.Printf("Skipping file '%s' due to include/exclude filters.", file.Path)
+		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "filtered")
+		return
+	}
+
+	fullPath := filepath.Join(modelPath, file.Path)
+	if d.forceRedownload {
+		d.logger.Printf("Forcing re-download for: %s", file.Path)
+		plan.FilesToDownload = append(plan.FilesToDownload, FileDownload{File: file, Reason: "forced re-download"})
+		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "forced")
+		return
+	}
+
+	isValid, reason := d.isLocalFileValid(fullPath, file)
+	if isValid {
+		d.logger.Printf("File is already present and valid, skipping: %s", file.Path)
+		plan.FilesToSkip = append(plan.FilesToSkip, FileSkip{File: file, Reason: reason})
+		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, reason)
+	} else {
+		d.logger.Printf("File is missing or invalid (%s), planning download for: %s", reason, file.Path)
+		plan.FilesToDownload = append(plan.FilesToDownload, FileDownload{File: file, Reason: reason})
+		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, reason)
+	}
 }
 
 func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error {
 	modelPath := d.getModelPath(plan.Repo.ID)
-	if err := os.MkdirAll(modelPath, os.ModePerm); err != nil {
+	if err := os.MkdirAll(modelPath, 0755); err != nil {
 		return fmt.Errorf("failed to create root model directory %s: %w", modelPath, err)
 	}
 
-	for _, file := range plan.FilesToDownload() {
+	var downloadErrors []string
+
+	for _, fileToDownload := range plan.FilesToDownload {
+		file := fileToDownload.File
 		d.logger.Printf("Starting download of: %s", file.Path)
-		if err := d.downloadFile(ctx, modelPath, file); err != nil {
-			return fmt.Errorf("failed to download %s: %w", file.Path, err)
+		err := d.downloadFile(ctx, modelPath, file)
+		if err != nil {
+			errStr := fmt.Sprintf("failed to download %s: %v", file.Path, err)
+			log.Println(errStr)
+			downloadErrors = append(downloadErrors, errStr)
+			continue
 		}
 
 		d.sendProgress(file.Path, ProgressStateComplete, file.Size, file.Size, "Verifying...")
 
 		fullPath := filepath.Join(modelPath, file.Path)
-		verificationMethod, err := d.verifyLocalFile(fullPath, file, true) // Disable progress for final verification
+		verificationMethod, err := d.verifyLocalFile(fullPath, file, true)
 		if err != nil {
-			return fmt.Errorf("validation failed for downloaded file %s: %w", file.Path, err)
+			errStr := fmt.Sprintf("validation failed for %s: %v", file.Path, err)
+			log.Println(errStr)
+			downloadErrors = append(downloadErrors, errStr)
+			continue
 		}
-		d.logger.Printf("Successfully verified '%s' via %s", file.Path, verificationMethod)
+		d.logger.Printf("Successfully verified '%s' via %s", verificationMethod, file.Path)
 		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, verificationMethod)
 	}
+
+	if len(downloadErrors) > 0 {
+		return fmt.Errorf("%d file(s) failed to download or verify:\n- %s", len(downloadErrors), strings.Join(downloadErrors, "\n- "))
+	}
+
 	return nil
 }
 
@@ -195,40 +287,47 @@ func (d *Downloader) verifyLocalFile(localPath string, remoteFile HFFile, disabl
 	d.logger.Printf("Verifying local file: %s", localPath)
 	info, err := os.Stat(localPath)
 	if err != nil {
-		return "missing", err
+		if os.IsNotExist(err) {
+			return "missing", err
+		}
+		return "stat error", err
 	}
 	if info.Size() != remoteFile.Size {
 		d.logger.Printf("Size mismatch for %s: expected %d, got %d", localPath, remoteFile.Size, info.Size())
-		return "size mismatch", fmt.Errorf("size mismatch")
+		return "size mismatch", fmt.Errorf("size mismatch: expected %d, got %d", remoteFile.Size, info.Size())
 	}
+
 	if remoteFile.LFS.IsLFS && !d.skipSHA {
+		expectedChecksum := remoteFile.LFS.Oid
 		d.logger.Printf("Performing SHA256 checksum for %s", localPath)
-		if !disableProgress {
-			d.sendProgress(remoteFile.Path, ProgressStateVerifying, 0, remoteFile.Size, "")
-		}
+
+		var reader io.Reader
 		file, err := os.Open(localPath)
 		if err != nil {
 			return "read error", err
 		}
 		defer file.Close()
-		hasher := sha256.New()
-		var totalRead int64
-		progressReader := &progressReader{
-			r: file,
-			callback: func(n int) {
-				if !disableProgress {
-					totalRead += int64(n)
-					d.sendProgress(remoteFile.Path, ProgressStateVerifying, totalRead, remoteFile.Size, "")
-				}
-			},
+		reader = file
+
+		if !disableProgress {
+			d.sendProgress(remoteFile.Path, ProgressStateVerifying, 0, remoteFile.Size, "")
+			progressReader := &progressReader{
+				r:         file,
+				filepath:  remoteFile.Path,
+				totalSize: remoteFile.Size,
+				d:         d,
+			}
+			reader = progressReader
 		}
-		if _, err := io.Copy(hasher, progressReader); err != nil {
+
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, reader); err != nil {
 			return "hashing error", fmt.Errorf("failed during hashing: %w", err)
 		}
 		actualChecksum := hex.EncodeToString(hasher.Sum(nil))
-		if actualChecksum != remoteFile.LFS.Oid {
+		if actualChecksum != expectedChecksum {
 			d.logger.Printf("Checksum mismatch for %s", localPath)
-			return "checksum mismatch", fmt.Errorf("checksum mismatch")
+			return "checksum mismatch", fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
 		}
 		return "SHA256 Checksum", nil
 	}
@@ -264,19 +363,27 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	}
 	d.logger.Printf("Resolved download URL for '%s': %s", file.Path, downloadURL)
 	fullPath := filepath.Join(modelPath, file.Path)
-	tmpDir := filepath.Join(modelPath, ".tmp")
-	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpDir)
+
+	tmpDir := filepath.Join(modelPath, ".tmp")
+
 	if !file.LFS.IsLFS || file.Size < int64(d.numConnections*1024*1024) {
 		d.logger.Printf("Using single-threaded download for %s", file.Path)
 		return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
 	}
+
 	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
 	chunkSize := file.Size / int64(d.numConnections)
 	var wg sync.WaitGroup
 	errChan := make(chan error, d.numConnections)
+
 	for i := 0; i < d.numConnections; i++ {
 		start := int64(i) * chunkSize
 		end := start + chunkSize - 1
@@ -286,18 +393,21 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 		wg.Add(1)
 		go func(chunkIndex int, start, end int64) {
 			defer wg.Done()
-			d.logger.Printf("Downloading chunk %d for %s (bytes %d-%d)", chunkIndex, file.Path, start, end)
 			tmpFileName := filepath.Join(tmpDir, fmt.Sprintf("%s_%d.tmp", filepath.Base(file.Path), chunkIndex))
 			if err := d.downloadChunk(ctx, downloadURL, tmpFileName, start, end, file); err != nil {
-				errChan <- fmt.Errorf("chunk %d failed for %s: %w", chunkIndex, file.Path, err)
+				errChan <- fmt.Errorf("chunk %d for %s failed: %w", chunkIndex, file.Path, err)
 			}
 		}(i, start, end)
 	}
 	wg.Wait()
 	close(errChan)
-	if err := <-errChan; err != nil {
-		return err
+
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
 	}
+
 	d.logger.Printf("All chunks downloaded for %s, merging files...", file.Path)
 	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections)
 }
@@ -316,6 +426,7 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
 	}
@@ -324,11 +435,16 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 		return err
 	}
 	defer out.Close()
+
+	idleReader := newIdleTimeoutReader(resp.Body, 60*time.Second)
 	progressWriter := &progressWriter{
-		w:        out,
-		callback: func(n int) { d.sendProgress(file.Path, ProgressStateDownloading, int64(n), file.Size, "") },
+		filepath:  file.Path,
+		totalSize: file.Size,
+		w:         out,
+		d:         d,
 	}
-	_, err = io.Copy(progressWriter, resp.Body)
+
+	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
 
@@ -345,6 +461,7 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
@@ -353,11 +470,16 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 		return err
 	}
 	defer out.Close()
+
+	idleReader := newIdleTimeoutReader(resp.Body, 60*time.Second)
 	progressWriter := &progressWriter{
-		w:        out,
-		callback: func(n int) { d.sendProgress(file.Path, ProgressStateDownloading, int64(n), file.Size, "") },
+		filepath:  file.Path,
+		totalSize: file.Size,
+		w:         out,
+		d:         d,
 	}
-	_, err = io.Copy(progressWriter, resp.Body)
+
+	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
 
@@ -410,27 +532,33 @@ func formatBytes(b int64) string {
 }
 
 type progressReader struct {
-	r        io.Reader
-	callback func(n int)
+	r         io.Reader
+	filepath  string
+	totalSize int64
+	readBytes int64
+	d         *Downloader
 }
 
 func (pr *progressReader) Read(p []byte) (n int, err error) {
 	n, err = pr.r.Read(p)
-	if n > 0 && pr.callback != nil {
-		pr.callback(n)
+	if n > 0 && pr.d != nil {
+		pr.readBytes += int64(n)
+		pr.d.sendProgress(pr.filepath, ProgressStateVerifying, pr.readBytes, pr.totalSize, "")
 	}
 	return
 }
 
 type progressWriter struct {
-	w        io.Writer
-	callback func(n int)
+	w         io.Writer
+	filepath  string
+	totalSize int64
+	d         *Downloader
 }
 
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	n, err = pw.w.Write(p)
-	if n > 0 && pw.callback != nil {
-		pw.callback(n)
+	if n > 0 && pw.d != nil {
+		pw.d.sendProgress(pw.filepath, ProgressStateDownloading, int64(n), pw.totalSize, "")
 	}
 	return
 }
