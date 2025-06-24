@@ -1,22 +1,25 @@
 # hfget - A Robust Hugging Face Downloader
 
-`hfget` is a lightweight, dependency-free, command-line utility for downloading models and datasets from Hugging Face. It is designed to be fast, reliable, and script-friendly, with features like concurrent downloads, file integrity verification, and interactive prompts.
+`hfget` is a lightweight, dependency-free, command-line utility for downloading models and datasets from Hugging Face. It is designed to be fast, reliable, and script-friendly, with features like concurrent downloads, file integrity verification, and advanced filtering.
 
 ## Features
 
-  * **Concurrent Downloads:** Utilizes multiple connections to download large files in parallel, significantly speeding up the process.
-  * **Integrity Verification:** Automatically verifies downloaded files against their expected size and SHA256 checksum to ensure they are not corrupted.
-  * **Intelligent Syncing:** Only downloads files that are missing or have failed verification, saving time and bandwidth.
-  * **Interactive & Scriptable:** Provides an interactive summary and confirmation prompt for manual use, which can be easily bypassed with a `--force` flag for use in scripts.
-  * **No External Dependencies:** The compiled binary is self-contained and does not require any external libraries or runtimes.
-  * **Advanced Filtering:** Download only specific files from a repository using a simple filter syntax.
+* **Concurrent Downloads:** Utilizes multiple connections to download large files in parallel, significantly speeding up the process.
+* **Integrity Verification:** Automatically verifies downloaded files against their expected size and SHA256 checksum (for LFS files) to ensure they are not corrupted.
+* **Intelligent Syncing:** Only downloads files that are missing or have failed local verification, saving time and bandwidth.
+* **Advanced Filtering:** Include or exclude specific files from a repository using glob patterns.
+* **Robust Error Handling:** Features an idle timeout to prevent freezes on stalled connections and retries on transient network errors. A single file failure will not stop the entire download job.
+* **Accurate Progress Display:** Provides smooth, accurate progress bars for both the initial file analysis and the download phases.
+* **Interactive & Scriptable:** Provides an interactive summary and confirmation prompt for manual use, which is automatically bypassed when not run in a terminal or when using the `--force` flag.
+* **Verbose Logging:** An optional `--verbose` flag provides detailed diagnostic output for troubleshooting.
+* **No External Dependencies:** The compiled binary is self-contained and does not require any external libraries or runtimes.
 
 ## Installation
 
 As long as you have a working Go environment, you can install `hfget` with a single command:
 
 ```sh
-go install github.com/drgo/hfget/cmd/hfget@latest
+go install [github.com/drgo/hfget/cmd/hfget@latest](https://github.com/drgo/hfget/cmd/hfget@latest)
 ```
 
 This will download the source, compile it, and place the `hfget` binary in your `$GOPATH/bin` directory. Make sure this directory is in your system's `PATH`.
@@ -41,23 +44,36 @@ This will download the `Llama-2-7B-GGUF` model from the user `TheBloke` into a d
 hfget TheBloke/Llama-2-7B-GGUF
 ```
 
-**2. Download a Dataset**
+**2. Download to a Nested Directory**
 
-To download a dataset, you must use the `-d` flag.
+Using the `--tree` flag preserves the original repository structure (`organization/model_name`).
+
+```sh
+# This will save files to a directory named 'TheBloke/Llama-2-7B-GGUF'
+hfget --tree TheBloke/Llama-2-7B-GGUF
+```
+
+**3. Download a Dataset**
+
+To download a dataset, you must use the `-d` (or `--dataset`) flag.
 
 ```sh
 hfget -d squad
 ```
 
-**3. Download with Filtering**
+**4. Download with Filtering**
 
-To download only specific files (e.g., only the `q4_K_M` and `q5_K_M` GGUF files), use a colon `:` followed by comma-separated keywords.
+Use the `--include` and `--exclude` flags with comma-separated glob patterns to control which files are downloaded.
 
 ```sh
-hfget TheBloke/Llama-2-7B-GGUF:q4_K_M,q5_K_M
+# Download only the Q4 and Q5 quantizations from a model
+hfget TheBloke/Llama-2-7B-GGUF --include "*.Q4_K_M.gguf,*.Q5_K_M.gguf"
+
+# Download everything EXCEPT the safetensors files
+hfget TheBloke/Llama-2-7B-GGUF --exclude "*.safetensors"
 ```
 
-**4. Force a Re-download**
+**5. Force a Re-download**
 
 To re-download all files from a repository, regardless of their local state, use the `-f` flag. This will also skip all interactive prompts.
 
@@ -67,53 +83,46 @@ hfget -f TheBloke/Llama-2-7B-GGUF
 
 ### Command-Line Flags
 
-| Flag               | Shorthand | Description                                                          | Default      |
-| ------------------ | --------- | -------------------------------------------------------------------- | ------------ |
-| `--dataset`        | `-d`      | Specify that the repository is a dataset.                            | `false`      |
-| `--branch`         | `-b`      | The repository branch to download from.                              | `"main"`     |
-| `--storage`        | `-s`      | The local directory where files will be saved.                       | `"./"`       |
-| `--concurrent`     | `-c`      | Number of concurrent connections for downloading large files.        | `5`          |
-| `--token`          | `-t`      | Your Hugging Face auth token. Can also be set via `HF_TOKEN` env var.  | `""`         |
-| `--skip-sha`       | `-k`      | Skip the SHA256 checksum verification for downloaded files.          | `false`      |
-| `--max-retries`    |           | Maximum number of retries for downloads on transient errors.         | `3`          |
-| `--retry-interval` |           | The time to wait between retries.                                    | `5s`         |
-| `--quiet`          | `-q`      | Suppress the interactive progress display and confirmation prompts.  | `false`      |
-| `--force`          | `-f`      | Force re-download of all files and implies `--quiet`.                | `false`      |
+Flags can also be set via environment variables (e.g., setting `HFGET_TOKEN` instead of using the `-t` flag).
+
+| Flag             | Shorthand | Environment Variable           | Description                                                 | Default |
+| :--------------- | :-------- | :----------------------------- | :---------------------------------------------------------- | :------ |
+| `--dataset`      | `-d`      |                                | Specify that the repository is a dataset.                   | `false` |
+| `--branch`       | `-b`      | `HFGET_BRANCH`                 | The repository branch to download from.                     | `"main"`  |
+| `--storage`      | `-s`      | `HFGET_STORAGE`                | The local directory where files will be saved.              | `"./"`    |
+| `--concurrent`   | `-c`      | `HFGET_CONCURRENT_CONNECTIONS` | Number of concurrent connections for downloading.           | `5`       |
+| `--token`        | `-t`      | `HFGET_TOKEN`                  | Your Hugging Face auth token.                               | `""`      |
+| `--skip-sha`     | `-k`      | `HFGET_SKIP_SHA`               | Skip SHA256 checksum verification for LFS files.            | `false`   |
+| `--tree`         |           |                                | Use nested tree structure for output directory.             | `false`   |
+| `--include`      |           |                                | Comma-separated glob patterns for files to include.         | `""`      |
+| `--exclude`      |           |                                | Comma-separated glob patterns for files to exclude.         | `""`      |
+| `--max-retries`  |           |                                | Maximum retries on transient network errors.                | `3`       |
+| `--retry-interval` |         |                                | The time to wait between retries.                           | `5s`      |
+| `--quiet`        | `-q`      |                                | Suppress interactive progress and prompts.                  | `false`   |
+| `--force`        | `-f`      |                                | Force re-download of all files (implies `--quiet`).         | `false`   |
+| `--verbose`      | `-v`      |                                | Enable verbose diagnostic logging to stderr.                | `false`   |
+| `--version`      |           |                                | Show version information and exit.                          | `false`   |
+
 
 ## Technical Implementation Details
 
-### How It Works: The Download Process
+`hfget` operates in distinct phases to ensure efficiency and correctness.
 
-`hfget` operates in two distinct phases to ensure efficiency and correctness.
+#### 1\. Fetching Phase
+First, the application makes API calls to Hugging Face to get a complete, recursive list of all files in the target repository. This provides a full manifest of the remote state.
 
-#### 1\. The Planning Phase
+#### 2\. Analysis & Planning Phase
+With the full remote file list, `hfget` builds a "download plan":
+1.  **Progress Display:** An "Analyzing (xx.x%)" progress bar appears, showing the overall progress of the local file check. The percentage is accurately calculated based on the total size of all files to be verified.
+2.  **Local File Check:** For each file in the remote manifest, it checks the local disk to see if a corresponding file already exists.
+3.  **Verification:** If a file exists, it's verified against its expected size and (for LFS files) its SHA256 checksum. The progress bar updates as this happens.
+4.  **Plan Creation:** Based on the verification results, a plan is created detailing which files to skip and which to download.
 
-Before any files are downloaded, the application first builds a "download plan":
-
-1.  **Fetch Metadata:** It makes an API call to Hugging Face to get the repository's metadata and a list of all files and folders at the root.
-2.  **Recursive Scan:** For each subdirectory, it makes further API calls to get a complete, recursive list of all files in the repository.
-3.  **Local File Check:** For each file in the remote repository, it checks the local disk to see if a corresponding file already exists.
-
-This leads to the download decision logic.
-
-#### 2\. The Execution Phase
-
-Once the plan is built and confirmed by the user, the application executes it:
-
-1.  **Concurrent Downloads:** For large files, the download is split into multiple chunks that are fetched simultaneously, maximizing bandwidth usage.
+#### 3\. Execution Phase
+Once the plan is built and (if in interactive mode) confirmed by the user, the application executes it:
+1.  **Concurrent Downloads:** For large files, the download is split into multiple chunks that are fetched simultaneously. An idle timeout ensures the download doesn't freeze on a stalled connection.
 2.  **File Assembly:** Once all chunks for a file are downloaded, they are assembled into a single file on disk.
-3.  **Verification:** After a file is assembled, it is immediately verified.
-
-### Download Decision Logic
-
-A file is only downloaded if one of the following conditions is met:
-
-  * The file does not exist locally.
-  * The local file exists, but its size does not match the size reported by the API.
-  * The local file exists and its size matches, but its SHA256 checksum does not match the checksum from the API (this check only applies to LFS files and is skipped if `-k` is used).
-  * The `--force` flag is used, which bypasses all of the above checks and marks every file for download.
-
-If all files are found to be present and valid, `hfget` will inform you and ask if you wish to force a re-download anyway, giving you full control over your local repositories.
+3.  **Continue on Failure:** If a file fails to download or pass verification, the error is logged, and the application continues to the next file, ensuring one bad file doesn't stop the entire job. A summary of any failures is presented at the end.
 
 ## License
 
