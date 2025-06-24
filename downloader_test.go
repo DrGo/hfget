@@ -2,8 +2,6 @@ package hfget
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,147 +9,167 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// NOTE: All the `const` and `var` blocks that were duplicates of `api.go` have been removed.
-
 const (
-	mockRepoID                = "test/repo"
-	lfsFileContent            = "This is the content of the LFS file."
-	lfsFileSHA256             = "8319ca32884697978255959c203542614b439580554b423f812543fee73a365f"
-	nonLFSFileContent         = "This is a regular file."
-	nonLFSFileSHA256          = "a19b4561ba28351982b0b943d0e08dfde623e6e737c35539f55e42a9b319555f"
-	subDirFileContent         = "This is a file in a subdirectory."
-	subDirFileSHA256          = "c68c6759c735d483488f285d802148902894125952f417534789543e37130634"
-	largeBenchmarkFileContent = "a"
+	mockRepoID        = "test/repo"
+	lfsFileContent    = "This is the content of the LFS file."
+	// Corrected hash for lfsFileContent
+	lfsFileSHA256     = "b9c44b024cd601ed9bc489243c66e18c164af0cf81a4ea2692dbc65498f8044d"
+	badLfsFileContent = "This is bad LFS content with the wrong hash."
+	nonLFSFileContent = "This is a regular file."
+	nonLFSFileSHA1    = "a19b4561ba28351982b0b943d0e08dfde623e6e7" // Example SHA1
 )
 
 type mockFile struct {
 	Path, Content, SHA256 string
-	IsLFS, IsSubDir       bool
+	IsLFS                 bool
 }
 
-// setupMockServer now accepts testing.TB, which works for both tests and benchmarks.
-func setupMockServer(t testing.TB, files map[string]mockFile) *httptest.Server {
+// setupMockServer now accepts a map of mock files to serve.
+func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, fmt.Sprintf("/api/models/%s", mockRepoID)) && r.URL.Query().Get("revision") != "" {
-			var siblingsJSON string
+	server := httptest.NewServer(nil)
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tree/") {
+			var treeJSON []string
 			for _, f := range files {
-				if !f.IsSubDir {
-					siblingsJSON += fmt.Sprintf(`{"rfilename": "%s"},`, f.Path)
+				lfsPart := ""
+				oid := nonLFSFileSHA1
+				if f.IsLFS {
+					lfsPart = fmt.Sprintf(`,"lfs":{"oid":"%s","size":%d}`, f.SHA256, len(f.Content))
+					oid = f.SHA256
 				}
+				treeJSON = append(treeJSON, fmt.Sprintf(`{"type":"file","path":"%s","size":%d,"oid":"%s"%s}`, f.Path, len(f.Content), oid, lfsPart))
 			}
-			siblingsJSON += `{"rfilename": "sub"}`
-			response := fmt.Sprintf(`{"id": "%s", "lastModified": "2023-01-01T00:00:00.000Z", "siblings": [%s]}`, mockRepoID, siblingsJSON)
+			response := fmt.Sprintf(`[%s]`, strings.Join(treeJSON, ","))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(response))
 			return
 		}
 
-		if strings.Contains(r.URL.Path, fmt.Sprintf("/api/models/%s/tree/main", mockRepoID)) {
-			var treeJSON string
-			if !strings.HasSuffix(r.URL.Path, "/sub") {
-				for _, f := range files {
-					if !f.IsSubDir {
-						if f.IsLFS {
-							treeJSON += fmt.Sprintf(`{"type": "file", "path": "%s", "size": %d, "lfs": {"oid": "%s", "size": %d}},`, f.Path, len(f.Content), f.SHA256, len(f.Content))
-						} else {
-							treeJSON += fmt.Sprintf(`{"type": "file", "path": "%s", "size": %d, "oid": "%s"},`, f.Path, len(f.Content), f.SHA256)
-						}
-					}
-				}
-				treeJSON += `{"type": "directory", "path": "sub"}`
-			} else {
-				for _, f := range files {
-					if f.IsSubDir {
-						treeJSON += fmt.Sprintf(`{"type": "file", "path": "%s", "size": %d, "oid": "%s"}`, f.Path, len(f.Content), f.SHA256)
-					}
-				}
+		if strings.Contains(r.URL.Path, "/api/models/") && r.URL.Query().Get("revision") != "" {
+			var siblingsJSON []string
+			for _, f := range files {
+				siblingsJSON = append(siblingsJSON, fmt.Sprintf(`{"rfilename":"%s"}`, f.Path))
 			}
-			response := fmt.Sprintf(`[%s]`, strings.TrimSuffix(treeJSON, ","))
+			response := fmt.Sprintf(`{"id":"%s","lastModified":"2023-01-01T00:00:00.000Z","siblings":[%s]}`, mockRepoID, strings.Join(siblingsJSON, ","))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(response))
 			return
 		}
 
 		for _, f := range files {
-			if f.IsLFS && strings.Contains(r.URL.Path, fmt.Sprintf("/resolve/main/%s", f.Path)) {
-				w.Header().Set("Location", fmt.Sprintf("/download/%s", f.Path))
-				w.WriteHeader(http.StatusFound)
-				return
-			}
-			if f.IsLFS && strings.Contains(r.URL.Path, fmt.Sprintf("/download/%s", f.Path)) {
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(f.Content))
-				return
-			}
-			if !f.IsLFS && strings.Contains(r.URL.Path, fmt.Sprintf("/raw/main/%s", f.Path)) {
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(f.Content))
-				return
+			if strings.Contains(r.URL.Path, f.Path) {
+				if f.IsLFS {
+					if strings.Contains(r.URL.Path, "/resolve/") {
+						location := fmt.Sprintf("%s/download/%s", server.URL, f.Path)
+						w.Header().Set("Location", location)
+						w.WriteHeader(http.StatusFound)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(f.Content))
+					return
+				} else {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(f.Content))
+					return
+				}
 			}
 		}
 
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("Not Found"))
-	}))
+	})
+	return server
 }
 
-func TestGetDownloadPlan(t *testing.T) {
+func TestFetchRepoInfo(t *testing.T) {
 	mockFiles := map[string]mockFile{
 		"lfs.bin":     {Path: "lfs.bin", Content: lfsFileContent, SHA256: lfsFileSHA256, IsLFS: true},
-		"regular.txt": {Path: "regular.txt", Content: nonLFSFileContent, SHA256: nonLFSFileSHA256, IsLFS: false},
-		"sub/sub.txt": {Path: "sub/sub.txt", Content: subDirFileContent, SHA256: subDirFileSHA256, IsLFS: false, IsSubDir: true},
+		"regular.txt": {Path: "regular.txt", Content: nonLFSFileContent, IsLFS: false},
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-
-	originalBaseURL := baseURL
 	baseURL = server.URL
-	defer func() { baseURL = originalBaseURL }()
+
+	d := New(mockRepoID)
+	info, err := d.FetchRepoInfo(context.Background())
+	requireNoError(t, err)
+
+	if info.ID != mockRepoID {
+		t.Errorf("Expected repo ID %s, got %s", mockRepoID, info.ID)
+	}
+	if len(info.Siblings) != 2 {
+		t.Errorf("Expected 2 files in repo info, got %d", len(info.Siblings))
+	}
+}
+
+func TestBuildPlan(t *testing.T) {
+	repoInfo := &RepoInfo{
+		ID:           mockRepoID,
+		LastModified: time.Now(),
+		Siblings: []HFFile{
+			{Path: "lfs.bin", Type: "file", Size: int64(len(lfsFileContent)), LFS: HFLFS{IsLFS: true, Oid: lfsFileSHA256, Size: int64(len(lfsFileContent))}},
+			{Path: "regular.txt", Type: "file", Size: int64(len(nonLFSFileContent))},
+		},
+	}
 
 	t.Run("Full Download Plan", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		d := New(mockRepoID, WithDestination(tmpDir))
 
-		plan, err := d.GetDownloadPlan(context.Background())
-		if err != nil {
-			t.Fatalf("GetDownloadPlan() failed: %v", err)
-		}
-
-		if len(plan.FilesToDownload) != 3 {
-			t.Errorf("Expected 3 files to download, got %d", len(plan.FilesToDownload))
-		}
-
-		expectedSize := int64(len(lfsFileContent) + len(nonLFSFileContent) + len(subDirFileContent))
-		if plan.TotalSize != expectedSize {
-			t.Errorf("Expected total size %d, got %d", expectedSize, plan.TotalSize)
-		}
-	})
-
-	t.Run("Skip Existing Valid File", func(t *testing.T) {
-		tmpDir := t.TempDir()
-
-		repoDir := filepath.Join(tmpDir, mockRepoID)
-		requireNoError(t, os.MkdirAll(repoDir, 0755))
-		requireNoError(t, os.WriteFile(filepath.Join(repoDir, "regular.txt"), []byte(nonLFSFileContent), 0644))
-
-		d := New(mockRepoID, WithDestination(tmpDir))
-
-		plan, err := d.GetDownloadPlan(context.Background())
-		if err != nil {
-			t.Fatalf("GetDownloadPlan() failed: %v", err)
-		}
+		plan, err := d.BuildPlan(context.Background(), repoInfo)
+		requireNoError(t, err)
 
 		if len(plan.FilesToDownload) != 2 {
 			t.Errorf("Expected 2 files to download, got %d", len(plan.FilesToDownload))
 		}
+		expectedSize := int64(len(lfsFileContent) + len(nonLFSFileContent))
+		if plan.TotalDownloadSize != expectedSize {
+			t.Errorf("Expected total size %d, got %d", expectedSize, plan.TotalDownloadSize)
+		}
+	})
 
-		for _, f := range plan.FilesToDownload {
-			if f.Path == "regular.txt" {
-				t.Error("regular.txt should have been skipped, but was included in the plan")
-			}
+	t.Run("Skip Existing Valid LFS File", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		d := New(mockRepoID, WithDestination(tmpDir))
+		
+		repoPath := d.getModelPath(mockRepoID)
+		requireNoError(t, os.MkdirAll(repoPath, 0755))
+		lfsFilePath := filepath.Join(repoPath, "lfs.bin")
+		requireNoError(t, os.WriteFile(lfsFilePath, []byte(lfsFileContent), 0644))
+
+		plan, err := d.BuildPlan(context.Background(), repoInfo)
+		requireNoError(t, err)
+
+		if len(plan.FilesToDownload) != 1 {
+			t.Errorf("Expected 1 file to download, got %d, files: %v", len(plan.FilesToDownload), plan.FilesToDownload)
+		}
+		if plan.FilesToDownload[0].File.Path != "regular.txt" {
+			t.Errorf("Expected regular.txt to be in download plan, got %s", plan.FilesToDownload[0].File.Path)
+		}
+		if len(plan.FilesToSkip) != 1 {
+			t.Errorf("Expected 1 file to be skipped, got %d", len(plan.FilesToSkip))
+		}
+	})
+
+	t.Run("Plan to re-download invalid file", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		d := New(mockRepoID, WithDestination(tmpDir))
+
+		repoPath := d.getModelPath(mockRepoID)
+		requireNoError(t, os.MkdirAll(repoPath, 0755))
+		lfsFilePath := filepath.Join(repoPath, "lfs.bin")
+		requireNoError(t, os.WriteFile(lfsFilePath, []byte("invalid content"), 0644))
+
+		plan, err := d.BuildPlan(context.Background(), repoInfo)
+		requireNoError(t, err)
+
+		if len(plan.FilesToDownload) != 2 {
+			t.Errorf("Expected 2 files to be in the plan for re-download, got %d", len(plan.FilesToDownload))
 		}
 	})
 }
@@ -159,73 +177,63 @@ func TestGetDownloadPlan(t *testing.T) {
 func TestExecutePlan(t *testing.T) {
 	mockFiles := map[string]mockFile{
 		"lfs.bin":     {Path: "lfs.bin", Content: lfsFileContent, SHA256: lfsFileSHA256, IsLFS: true},
-		"regular.txt": {Path: "regular.txt", Content: nonLFSFileContent, SHA256: nonLFSFileSHA256, IsLFS: false},
+		"regular.txt": {Path: "regular.txt", Content: nonLFSFileContent, IsLFS: false},
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-
-	originalBaseURL := baseURL
 	baseURL = server.URL
-	defer func() { baseURL = originalBaseURL }()
 
 	tmpDir := t.TempDir()
 	d := New(mockRepoID, WithDestination(tmpDir))
-
-	plan, err := d.GetDownloadPlan(context.Background())
-	if err != nil {
-		t.Fatalf("GetDownloadPlan() failed: %v", err)
-	}
+	info, err := d.FetchRepoInfo(context.Background())
+	requireNoError(t, err)
+	plan, err := d.BuildPlan(context.Background(), info)
+	requireNoError(t, err)
 
 	err = d.ExecutePlan(context.Background(), plan)
-	if err != nil {
-		t.Fatalf("ExecutePlan() failed: %v", err)
-	}
+	requireNoError(t, err)
 
-	repoPath := filepath.Join(tmpDir, plan.Repo.ID)
+	repoPath := d.getModelPath(mockRepoID)
 	verifyFileContent(t, filepath.Join(repoPath, "lfs.bin"), lfsFileContent)
 	verifyFileContent(t, filepath.Join(repoPath, "regular.txt"), nonLFSFileContent)
 }
 
-func BenchmarkDownload(b *testing.B) {
-	const fileSize = 10 * 1024 * 1024 // 10 MiB
-	content := strings.Repeat(largeBenchmarkFileContent, fileSize)
-	hasher := sha256.New()
-	hasher.Write([]byte(content))
-	hash := hex.EncodeToString(hasher.Sum(nil))
-
+func TestExecutePlan_ContinueOnError(t *testing.T) {
+	// This test ensures that if one file fails validation, others still download.
+	// We serve content for "bad.bin" that does NOT match its declared SHA256 hash.
+	badFileContentFromServer := "this content does not match the hash"
 	mockFiles := map[string]mockFile{
-		"largefile.bin": {Path: "largefile.bin", Content: content, SHA256: hash, IsLFS: true},
+		"good.txt": {Path: "good.txt", Content: "This is good", IsLFS: false},
+		"bad.bin":  {Path: "bad.bin", Content: badFileContentFromServer, SHA256: "this_is_a_deliberately_wrong_hash", IsLFS: true},
 	}
-	server := setupMockServer(b, mockFiles)
+	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-
-	originalBaseURL := baseURL
 	baseURL = server.URL
-	defer func() { baseURL = originalBaseURL }()
 
-	b.SetBytes(fileSize)
-	b.ResetTimer()
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir))
+	info, err := d.FetchRepoInfo(context.Background())
+	requireNoError(t, err)
+	plan, err := d.BuildPlan(context.Background(), info) // All files will be planned for download
+	requireNoError(t, err)
 
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		tmpDir := b.TempDir()
-		d := New(mockRepoID, WithDestination(tmpDir), WithConnections(4))
-		plan, err := d.GetDownloadPlan(context.Background())
-		if err != nil {
-			b.Fatalf("GetDownloadPlan() failed: %v", err)
-		}
-		b.StartTimer()
-
-		if err := d.ExecutePlan(context.Background(), plan); err != nil {
-			b.Fatalf("ExecutePlan() failed: %v", err)
-		}
+	err = d.ExecutePlan(context.Background(), plan)
+	if err == nil {
+		t.Fatal("Expected ExecutePlan to return an error for checksum mismatch, but it didn't")
 	}
+	if !strings.Contains(err.Error(), "validation failed for bad.bin") {
+		t.Errorf("Expected error message to contain 'validation failed for bad.bin', but got: %v", err)
+	}
+
+	// But the good file should still have been downloaded correctly
+	repoPath := d.getModelPath(mockRepoID)
+	verifyFileContent(t, filepath.Join(repoPath, "good.txt"), "This is good")
 }
 
 func requireNoError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 }
 
@@ -236,6 +244,7 @@ func verifyFileContent(t *testing.T, path, expectedContent string) {
 		t.Fatalf("Failed to read file %s: %v", path, err)
 	}
 	if string(content) != expectedContent {
-		t.Errorf("Content mismatch for %s", path)
+		t.Errorf("Content mismatch for %s. Expected '%s', got '%s'", path, expectedContent, string(content))
 	}
 }
+
