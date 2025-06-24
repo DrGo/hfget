@@ -1,5 +1,10 @@
 package hfget
 
+import (
+	"io"
+	"time"
+)
+
 // WithAuthToken sets the Hugging Face auth token.
 func WithAuthToken(token string) Option {
 	return func(d *Downloader) {
@@ -43,13 +48,19 @@ func AsDataset() Option {
 	}
 }
 
-// WithFilter specifies which files to include based on substrings.
-func WithFilter(filter []string) Option {
+// WithIncludePatterns sets glob patterns for files to include.
+func WithIncludePatterns(patterns []string) Option {
 	return func(d *Downloader) {
-		d.filter = filter
+		d.includePatterns = patterns
 	}
 }
 
+// WithExcludePatterns sets glob patterns for files to exclude.
+func WithExcludePatterns(patterns []string) Option {
+	return func(d *Downloader) {
+		d.excludePatterns = patterns
+	}
+}
 // WithProgressChannel sets a channel to receive progress updates.
 func WithProgressChannel(p chan<- Progress) Option {
 	return func(d *Downloader) {
@@ -61,5 +72,36 @@ func WithProgressChannel(p chan<- Progress) Option {
 func SkipSHACheck() Option {
 	return func(d *Downloader) {
 		d.skipSHA = true
+	}
+}
+
+// WithForceRedownload bypasses local file checks and downloads all files.
+func WithForceRedownload() Option {
+	return func(d *Downloader) {
+		d.forceRedownload = true
+	}
+}
+
+// WithTreeStructure enables saving to a nested directory structure (e.g., org/model).
+func WithTreeStructure() Option {
+	return func(d *Downloader) {
+		d.useTreeStructure = true
+	}
+}
+
+
+// WithVerboseOutput sets an io.Writer for verbose logging.
+func WithVerboseOutput(w io.Writer) Option {
+	return func(d *Downloader) {
+		d.setLogger(w)
+	}
+}
+
+// WithTimeout sets the timeout for all HTTP requests.
+func WithTimeout(timeout time.Duration) Option {
+	return func(d *Downloader) {
+		if timeout > 0 {
+			d.client.Timeout = timeout
+		}
 	}
 }

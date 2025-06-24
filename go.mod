@@ -7,6 +7,7 @@ require (
 	github.com/fatih/color v1.18.0
 	github.com/joho/godotenv v1.5.1
 	github.com/spf13/cobra v1.9.1
+	golang.org/x/term v0.32.0
 )
 
 require (

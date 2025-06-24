@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -17,10 +16,11 @@ var (
 	ErrAuthentication = errors.New("authentication failed (401): check your token")
 	ErrForbidden      = errors.New("forbidden (403): you may need to accept the repository's terms on the Hugging Face website")
 	ErrNotFound       = errors.New("not found (404): check the repository name and branch")
+
+	baseURL                = "https://huggingface.co"
 )
 
 const (
-	baseURL                = "https://huggingface.co"
 	jsonModelsInfoURL      = "/api/models/%s?revision=%s"
 	jsonDatasetsInfoURL    = "/api/datasets/%s?revision=%s"
 	jsonModelsFileTreeURL  = "/api/models/%s/tree/%s"
@@ -252,25 +252,4 @@ func (d *Downloader) buildResolverURL(filePath string, isLFS bool) string {
 		}
 	}
 	return baseURL + fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch), filePath)
-}
-
-func (d *Downloader) parseRepoName(name string) {
-	parts := strings.Split(name, ":")
-	d.repoName = parts[0]
-	if len(parts) > 1 && parts[1] != "" {
-		d.filter = strings.Split(parts[1], ",")
-	}
-}
-
-func (d *Downloader) shouldSkipByFilter(filePath string) bool {
-	if len(d.filter) == 0 {
-		return false
-	}
-	lowerPath := strings.ToLower(filePath)
-	for _, f := range d.filter {
-		if strings.Contains(lowerPath, strings.ToLower(f)) {
-			return false
-		}
-	}
-	return true
 }

@@ -6,163 +6,285 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	hfg "github.com/drgo/hfget"
+	"golang.org/x/term"
 )
 
-const VERSION = "4.0.0"
+var version = "5.8.0"
+
+type downloader interface {
+	GetDownloadPlan(ctx context.Context) (*hfg.DownloadPlan, error)
+	ExecutePlan(ctx context.Context, plan *hfg.DownloadPlan) error
+}
+
+type realDownloader struct {
+	*hfg.Downloader
+}
+
+type cliApp struct {
+	out           io.Writer
+	err           io.Writer
+	isTerminal    bool
+	terminalFd    int
+	newDownloader func(repoName string, opts ...hfg.Option) downloader
+}
 
 func main() {
-	log.SetFlags(0) // Remove timestamps from logger
-	// --- 1. Flag Definitions ---
+	fd := int(os.Stderr.Fd())
+	isTerm := term.IsTerminal(fd)
+
+	app := &cliApp{
+		out:        os.Stdout,
+		err:        os.Stderr,
+		isTerminal: isTerm,
+		terminalFd: fd,
+		newDownloader: func(repoName string, opts ...hfg.Option) downloader {
+			return &realDownloader{Downloader: hfg.New(repoName, opts...)}
+		},
+	}
+	if err := app.run(os.Args[1:]); err != nil {
+		log.New(app.err, "", 0).Fatalf("Error: %v", err)
+	}
+}
+
+func (app *cliApp) run(args []string) error {
+	log.SetOutput(app.err)
+	log.SetFlags(0)
+
 	var (
-		isDatasetFlag  bool
-		branch         string
-		storage        string
-		numConnections int
-		token          string
-		skipSHA        bool
-		maxRetries     int
-		retryInterval  time.Duration
-		quiet          bool
-		force          bool
+		isDatasetFlag   bool
+		branch          string
+		storage         string
+		numConnections  int
+		token           string
+		skipSHA         bool
+		maxRetries      int
+		retryInterval   time.Duration
+		quiet           bool
+		force           bool
+		useTree         bool
+		includePatterns string
+		excludePatterns string
+		showVersion     bool
+		verbose         bool
+		timeout         time.Duration
 	)
 
-	flag.BoolVar(&isDatasetFlag, "d", false, "Specify that the repo is a dataset")
-	flag.StringVar(&branch, "b", "main", "Branch of the model or dataset")
-	flag.StringVar(&storage, "s", "./", "Storage path for downloads")
-	flag.IntVar(&numConnections, "c", 5, "Number of concurrent connections")
-	flag.StringVar(&token, "t", os.Getenv("HF_TOKEN"), "HuggingFace Auth Token (or from HF_TOKEN env var)")
-	flag.BoolVar(&skipSHA, "k", false, "Skip SHA256 hash check")
-	flag.IntVar(&maxRetries, "max-retries", 3, "Maximum number of retries")
-	flag.DurationVar(&retryInterval, "retry-interval", 5*time.Second, "Interval between retries")
-	flag.BoolVar(&quiet, "q", false, "Quiet mode (suppress progress display and prompts)")
-	flag.BoolVar(&force, "f", false, "Force download (synonym for --quiet)")
+	fs := flag.NewFlagSet("hfget", flag.ContinueOnError)
+	fs.SetOutput(app.err)
 
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] model_or_dataset_name\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "Example: hfget TheBloke/Llama-2-7B-GGUF")
-		fmt.Fprintln(os.Stderr, "Options:")
-		flag.PrintDefaults()
+	fs.BoolVar(&isDatasetFlag, "d", false, "Specify that the repo is a dataset")
+	fs.StringVar(&branch, "b", envOrDefault("HFGET_BRANCH", "main"), "Branch of the model or dataset ($HFGET_BRANCH)")
+	fs.StringVar(&storage, "s", envOrDefault("HFGET_STORAGE", "./"), "Storage path for downloads ($HFGET_STORAGE)")
+	defaultConnections, _ := strconv.Atoi(envOrDefault("HFGET_CONCURRENT_CONNECTIONS", "5"))
+	fs.IntVar(&numConnections, "c", defaultConnections, "Number of concurrent connections ($HFGET_CONCURRENT_CONNECTIONS)")
+	fs.StringVar(&token, "t", envOrDefault("HFGET_TOKEN", ""), "HuggingFace Auth Token ($HFGET_TOKEN)")
+	defaultSkipSHA, _ := strconv.ParseBool(envOrDefault("HFGET_SKIP_SHA", "false"))
+	fs.BoolVar(&skipSHA, "k", defaultSkipSHA, "Skip SHA256 hash check ($HFGET_SKIP_SHA)")
+	fs.IntVar(&maxRetries, "max-retries", 3, "Maximum number of retries")
+	fs.DurationVar(&retryInterval, "retry-interval", 5*time.Second, "Interval between retries")
+	fs.BoolVar(&quiet, "q", false, "Quiet mode (suppress progress display and prompts)")
+	fs.BoolVar(&force, "f", false, "Force re-download of all files, implies quiet mode")
+	fs.BoolVar(&useTree, "tree", false, "Use nested tree structure for output directory (e.g. 'org/model')")
+	fs.StringVar(&includePatterns, "include", "", "Comma-separated glob patterns for files to download")
+	fs.StringVar(&excludePatterns, "exclude", "", "Comma-separated glob patterns for files to exclude")
+	fs.BoolVar(&showVersion, "version", false, "Show version information")
+	fs.BoolVar(&verbose, "v", false, "Enable verbose diagnostic logging to stderr")
+	fs.DurationVar(&timeout, "timeout", 60*time.Second, "Timeout for network requests")
+
+	fs.Usage = func() {
+		fmt.Fprintf(app.err, "Usage: %s [options] model_or_dataset_name\n", os.Args[0])
+		fmt.Fprintln(app.err, "Example: hfget TheBloke/Llama-2-7B-GGUF --include \"*.gguf\"")
+		fmt.Fprintln(app.err, "Options:")
+		fs.PrintDefaults()
 	}
 
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return nil
+	}
 
-	if force {
+	if showVersion {
+		fmt.Fprintf(app.out, "hfget version %s\n", version)
+		return nil
+	}
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		return errors.New("a model or dataset name argument is required")
+	}
+	repoName := fs.Arg(0)
+
+	if !app.isTerminal {
 		quiet = true
 	}
 
-	// --- 2. Argument and Repo Handling ---
-	if flag.NArg() < 1 {
-		handleError("a model or dataset name argument is required.")
-	}
-	repoName := flag.Arg(0)
-
-	// --- 3. Planning Phase ---
-	opts := []hfg.Option{
-		hfg.WithBranch(branch),
-		hfg.WithDestination(storage),
-		hfg.WithConnections(numConnections),
-	}
-	if isDatasetFlag {
-		opts = append(opts, hfg.AsDataset())
-	}
-	if token != "" {
-		opts = append(opts, hfg.WithAuthToken(token))
-	}
-	if skipSHA {
-		opts = append(opts, hfg.SkipSHACheck())
-	}
-
-	downloader := hfg.New(repoName, opts...)
-	log.Println("Analyzing repository...")
-	plan, err := downloader.GetDownloadPlan(context.Background())
-	if err != nil {
-		handleError(fmt.Sprintf("could not analyze repository: %v", err))
-	}
-
-	if len(plan.FilesToDownload) == 0 {
-		log.Println("All model files are already present and valid. Nothing to download.")
-		os.Exit(0)
-	}
-
-	// --- 4. Confirmation Prompt ---
-	if !quiet {
-		fmt.Println("----------------------------------------------------")
-		fmt.Printf("Repository: %s\n", plan.Repo.ID)
-		fmt.Printf("Last Modified: %s\n", plan.Repo.LastModified.Format(time.RFC1123))
-		fmt.Println("----------------------------------------------------")
-		fmt.Println("Files to be downloaded:")
-		for _, file := range plan.FilesToDownload {
-			fmt.Printf("  - %-60s (%s)\n", file.Path, formatBytes(file.Size))
+	for {
+		if force {
+			quiet = true
 		}
-		fmt.Println("----------------------------------------------------")
-		fmt.Printf("Total download size: %s\n", formatBytes(plan.TotalSize))
-		fmt.Print("Proceed with download? [y/N]: ")
 
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		if strings.TrimSpace(strings.ToLower(input)) != "y" {
-			log.Println("Download cancelled by user.")
-			os.Exit(0)
+		opts := []hfg.Option{
+			hfg.WithBranch(branch), hfg.WithDestination(storage), hfg.WithConnections(numConnections),
+			hfg.WithTimeout(timeout),
 		}
-	}
-
-	// --- 5. Execution Phase ---
-	var wg sync.WaitGroup
-	if !quiet {
-		progressChan := make(chan hfg.Progress)
-		// Add progress channel option to existing options
-		opts = append(opts, hfg.WithProgressChannel(progressChan))
-		downloader = hfg.New(repoName, opts...)
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			displayProgressStdLib(progressChan)
-			close(progressChan) // Ensure channel is closed when goroutine exits
-		}()
-	}
-
-	log.Println("Starting download...")
-	for i := 0; i < maxRetries; i++ {
-		if i > 0 {
-			log.Printf("Attempt %d of %d after error: %v", i+1, maxRetries, err)
-			time.Sleep(retryInterval)
+		if isDatasetFlag {
+			opts = append(opts, hfg.AsDataset())
 		}
-		err = downloader.ExecutePlan(context.Background(), plan)
-		if err == nil {
-			break
+		if token != "" {
+			opts = append(opts, hfg.WithAuthToken(token))
 		}
-		if !isTransientError(err) {
-			handleError(fmt.Sprintf("a fatal error occurred: %v", err))
+		if skipSHA {
+			opts = append(opts, hfg.SkipSHACheck())
 		}
-	}
+		if force {
+			opts = append(opts, hfg.WithForceRedownload())
+		}
+		if useTree {
+			opts = append(opts, hfg.WithTreeStructure())
+		}
+		if includePatterns != "" {
+			opts = append(opts, hfg.WithIncludePatterns(strings.Split(includePatterns, ",")))
+		}
+		if excludePatterns != "" {
+			opts = append(opts, hfg.WithExcludePatterns(strings.Split(excludePatterns, ",")))
+		}
+		if verbose {
+			opts = append(opts, hfg.WithVerboseOutput(app.err))
+		}
 
-	if !quiet {
-		// This wait ensures the progress display finishes drawing before the final log messages.
-		wg.Wait()
-		fmt.Println()
-	}
+		var wg sync.WaitGroup
+		var progressChan chan hfg.Progress
+		if !quiet {
+			progressChan = make(chan hfg.Progress)
+			opts = append(opts, hfg.WithProgressChannel(progressChan))
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				displayProgressStdLib(app.err, progressChan, app.terminalFd)
+			}()
+		}
 
-	if err != nil {
-		handleError(fmt.Sprintf("failed to download after %d attempts: %v", maxRetries, err))
-	}
+		downloader := app.newDownloader(repoName, opts...)
 
-	log.Printf("Download of %s completed successfully.", repoName)
+		if !quiet || verbose {
+			log.Println("Analyzing repository...")
+		}
+		plan, err := downloader.GetDownloadPlan(context.Background())
+		if err != nil {
+			if !quiet {
+				close(progressChan)
+				wg.Wait()
+			}
+			return fmt.Errorf("could not analyze repository: %w", err)
+		}
+
+		if len(plan.FilesToDownload()) == 0 {
+			if !quiet {
+				close(progressChan)
+				wg.Wait()
+			}
+			if len(plan.FilesToSkip) > 0 {
+				log.Printf("%d files are already present and valid (Total Size: %s).", len(plan.FilesToSkip), formatBytes(plan.TotalSkipSize))
+			}
+			log.Println("Nothing to download.")
+			if force {
+				return nil
+			}
+			fmt.Fprint(app.err, "Would you like to force a re-download anyway? [y/N]: ")
+			reader := bufio.NewReader(os.Stdin)
+			input, _ := reader.ReadString('\n')
+			if strings.TrimSpace(strings.ToLower(input)) == "y" {
+				force = true
+				log.Println("Forcing re-download as requested...")
+				continue
+			} else {
+				log.Println("Exiting.")
+				return nil
+			}
+		}
+
+		if !quiet {
+			fmt.Fprintf(app.err, "\r\033[2K")
+			fmt.Fprintln(app.err, "----------------------------------------------------")
+			fmt.Fprintf(app.err, "Repository:    %s\n", plan.Repo.ID)
+			fmt.Fprintf(app.err, "Last Modified: %s\n", plan.Repo.LastModified.Format(time.RFC1123))
+			fmt.Fprintln(app.err, "----------------------------------------------------")
+			if len(plan.FilesToSkip) > 0 {
+				fmt.Fprintf(app.err, "%d files already present and valid (Total: %s) will be skipped.\n", len(plan.FilesToSkip), formatBytes(plan.TotalSkipSize))
+			}
+			if len(plan.FilesToDownloadMissing) > 0 {
+				fmt.Fprintln(app.err, "New files to be downloaded:")
+				for _, file := range plan.FilesToDownloadMissing {
+					fmt.Fprintf(app.err, "  - %-60s (%s)\n", file.Path, formatBytes(file.Size))
+				}
+			}
+			if len(plan.FilesToDownloadInvalid) > 0 {
+				fmt.Fprintln(app.err, "Invalid local files to be re-downloaded:")
+				for _, file := range plan.FilesToDownloadInvalid {
+					fmt.Fprintf(app.err, "  - %-60s (%s)\n", file.Path, formatBytes(file.Size))
+				}
+			}
+			fmt.Fprintln(app.err, "----------------------------------------------------")
+			fmt.Fprintf(app.err, "Total download size: %s\n", formatBytes(plan.TotalDownloadSize))
+			fmt.Fprint(app.err, "Proceed with download? [y/N]: ")
+
+			reader := bufio.NewReader(os.Stdin)
+			input, _ := reader.ReadString('\n')
+			if strings.TrimSpace(strings.ToLower(input)) != "y" {
+				log.Println("Download cancelled by user.")
+				if !quiet {
+					close(progressChan)
+					wg.Wait()
+				}
+				return nil
+			}
+		}
+
+		log.Println("Starting download...")
+		for i := 0; i < maxRetries; i++ {
+			if i > 0 {
+				fmt.Fprintln(app.err)
+				log.Printf("Attempt %d of %d after error: %v", i+1, maxRetries, err)
+				time.Sleep(retryInterval)
+			}
+			err = downloader.ExecutePlan(context.Background(), plan)
+			if err == nil {
+				break
+			}
+			if !isTransientError(err) {
+				return fmt.Errorf("a fatal error occurred: %w", err)
+			}
+		}
+
+		if !quiet {
+			close(progressChan)
+			wg.Wait()
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to download after %d attempts: %w", err)
+		}
+
+		log.Printf("Download of %s completed successfully.", repoName)
+		break
+	}
+	return nil
 }
 
-// handleError prints a concise error and exits.
-func handleError(msg string) {
-	fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
-	fmt.Fprintln(os.Stderr, "Run with -h for usage information.")
-	os.Exit(1)
+func envOrDefault(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
 }
 
 func isTransientError(err error) bool {
@@ -174,52 +296,133 @@ func isTransientError(err error) bool {
 }
 
 type fileState struct {
-	total, downloaded int64
+	total, downloadedBytes, verifiedBytes int64
 }
 
-func displayProgressStdLib(progressChan <-chan hfg.Progress) {
+func displayProgressStdLib(out io.Writer, progressChan <-chan hfg.Progress, fd int) {
 	fileProgress := make(map[string]*fileState)
-	var totalSize, totalDownloaded int64
+	var totalDownloadSize, totalDownloaded, totalVerifiedSize, totalVerified int64
+	var downloadStartTime time.Time
+	var recentBytes int64
+	var recentTime time.Time
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	var lastActiveFile string
 
-	updateDisplay := func() {
-		var currentFileDisplay string
-		if state, ok := fileProgress[lastActiveFile]; ok && state.total > 0 {
-			filePercent := float64(state.downloaded) * 100 / float64(state.total)
-			currentFileDisplay = fmt.Sprintf(" | %s: %.1f%%", truncateString(lastActiveFile, 20), filePercent)
-		}
-		totalPercent := 0.0
-		if totalSize > 0 {
-			totalPercent = float64(totalDownloaded) * 100 / float64(totalSize)
-		}
-		output := fmt.Sprintf("Total: %.1f%% (%s / %s)%s", totalPercent, formatBytes(totalDownloaded), formatBytes(totalSize), currentFileDisplay)
-		fmt.Printf("\r%-80s", output)
-	}
+	var lastActiveFile string
+	var currentPhase string = "Analyzing"
+	spinner := []rune{'|', '/', '-', '\\'}
+	spinnerIndex := 0
+	linesPrinted := 0
+
+	const (
+		moveUp    = "\033[A"
+		clearLine = "\r\033[2K"
+	)
 
 	for {
 		select {
 		case pr, ok := <-progressChan:
 			if !ok {
-				updateDisplay()
+				if linesPrinted > 0 {
+					fmt.Fprint(out, strings.Repeat(moveUp, linesPrinted-1), clearLine)
+				}
 				return
 			}
 			if _, exists := fileProgress[pr.Filepath]; !exists {
-				fileProgress[pr.Filepath] = &fileState{total: pr.TotalSize}
-				totalSize += pr.TotalSize
+				state := &fileState{total: pr.TotalSize}
+				fileProgress[pr.Filepath] = state
+				// This total is for all files that *might* be downloaded or verified
+				totalVerifiedSize += pr.TotalSize
+				totalDownloadSize += pr.TotalSize
 			}
 			state := fileProgress[pr.Filepath]
 			lastActiveFile = pr.Filepath
-			delta := pr.CurrentSize - state.downloaded
-			state.downloaded += delta
-			totalDownloaded += delta
-			if pr.State == hfg.ProgressStateSkipped {
-				totalDownloaded += (pr.TotalSize - state.downloaded)
-				state.downloaded = pr.TotalSize
+
+			switch pr.State {
+			case hfg.ProgressStateVerifying:
+				currentPhase = "Verifying"
+				// Verification progress is absolute
+				delta := pr.CurrentSize - state.verifiedBytes
+				if delta > 0 {
+					state.verifiedBytes += delta
+					totalVerified += delta
+				}
+			case hfg.ProgressStateDownloading:
+				if currentPhase != "Downloading" {
+					// First download event, reset totals for download phase
+					currentPhase = "Downloading"
+					totalDownloaded = totalVerified // Start download progress from where verification left off
+				}
+				if downloadStartTime.IsZero() {
+					downloadStartTime = time.Now()
+					recentTime = time.Now()
+				}
+				delta := pr.CurrentSize
+				state.downloadedBytes += delta
+				totalDownloaded += delta
+				recentBytes += delta
+			case hfg.ProgressStateVerified:
+				delta := state.total - state.verifiedBytes
+				state.verifiedBytes += delta
+				totalVerified += delta
+			case hfg.ProgressStateSkipped:
+				delta := pr.TotalSize - state.verifiedBytes
+				state.verifiedBytes += delta
+				totalVerified += delta
 			}
 		case <-ticker.C:
-			updateDisplay()
+			// ---- RENDER LOGIC ----
+			if linesPrinted > 0 {
+				fmt.Fprint(out, strings.Repeat(moveUp, linesPrinted-1), clearLine)
+			}
+			width, _, _ := term.GetSize(fd)
+			if width == 0 {
+				width = 90 // Fallback width
+			}
+
+			if currentPhase == "Verifying" {
+				spinnerIndex = (spinnerIndex + 1) % len(spinner)
+				var filePercent float64
+				if state, ok := fileProgress[lastActiveFile]; ok && state.total > 0 {
+					filePercent = float64(state.verifiedBytes) * 100 / float64(state.total)
+				}
+				output := fmt.Sprintf("Verifying: [%c] %s (%.1f%%)", spinner[spinnerIndex], lastActiveFile, filePercent)
+				fmt.Fprint(out, clearLine, output)
+				linesPrinted = 1
+			} else { // Downloading
+				var overallPercent float64
+				if totalDownloadSize > 0 {
+					overallPercent = float64(totalDownloaded) * 100 / float64(totalDownloadSize)
+				}
+				elapsed := time.Since(downloadStartTime).Seconds()
+				avgSpeed := float64(totalDownloaded) / elapsed
+				var currentSpeed float64
+				recentElapsed := time.Since(recentTime).Seconds()
+				if recentElapsed > 0.5 {
+					currentSpeed = float64(recentBytes) / recentElapsed
+					recentBytes = 0
+					recentTime = time.Now()
+				}
+				line1 := fmt.Sprintf("Overall: %.1f%% (%s/%s) | Avg: %s/s | Current: %s/s",
+					overallPercent, formatBytes(totalDownloaded), formatBytes(totalDownloadSize), formatBytes(int64(avgSpeed)), formatBytes(int64(currentSpeed)))
+
+				var line2 string
+				if state, ok := fileProgress[lastActiveFile]; ok && state.total > 0 && state.downloadedBytes < state.total {
+					filePercent := float64(state.downloadedBytes) * 100 / float64(state.total)
+					line2 = fmt.Sprintf("File: %s (%.1f%%)", truncateString(lastActiveFile, width-20), filePercent)
+				} else {
+					line2 = "Finalizing..."
+				}
+
+				if len(line1)+len(line2) > width-5 {
+					fmt.Fprint(out, clearLine, line1, "\n", clearLine, line2)
+					linesPrinted = 2
+				} else {
+					output := fmt.Sprintf("%s | %s", line1, line2)
+					fmt.Fprint(out, clearLine, output)
+					linesPrinted = 1
+				}
+			}
 		}
 	}
 }
@@ -238,6 +441,9 @@ func formatBytes(b int64) string {
 }
 
 func truncateString(s string, maxLen int) string {
+	if s == "" {
+		return ""
+	}
 	if len(s) <= maxLen {
 		return s
 	}

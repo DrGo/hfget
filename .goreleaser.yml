@@ -1,0 +1,58 @@
+# .goreleaser.yml
+# This is the configuration for GoReleaser.
+# It defines how your project should be built, packaged, and released.
+
+project_name: hfget
+
+# The `builds` section defines how to compile your application.
+builds:
+  - # Each entry in the builds section is a separate build configuration.
+    # We only need one for this project.
+    id: hfget
+    # The main entry point for your application.
+    main: ./cmd/
+    # The name of the binary to be produced.
+    binary: hfget
+    # Go environment variables.
+    env:
+      - CGO_ENABLED=0
+    # ldflags are used to inject variables at compile time.
+    # Here we inject the version, commit, and date from the git tag.
+    ldflags:
+      - -s -w -X main.VERSION={{.Version}}
+    # A list of OS/Architecture combinations to build for.
+    # This list covers the most common platforms.
+    goos:
+      - linux
+      - windows
+      - darwin 
+      - freebsd 
+      - openbsd 
+    goarch:
+      - amd64
+      - arm64
+
+# The `archives` section defines how the compiled binaries should be packaged.
+archives:
+  - # Each entry creates a set of archives.
+    id: hfget-archives
+    # A template for the archive name. e.g., hfget_1.0.0_windows_amd64.zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # The format of the archive. GoReleaser will use .tar.gz for Linux/macOS
+    # and .zip for Windows automatically.
+    format: binary
+    # Files to include in the archive besides the binary.
+    files:
+      - README.md
+      - LICENSE # <-- Make sure you have a LICENSE file
+
+# The `checksum` section generates a file with SHA256 checksums for all artifacts.
+checksum:
+  # The name of the checksum file.
+  name_template: "checksums.txt"
+
+# The `release` section customizes the GitHub Release itself.
+release:
+  # If set to true, GoReleaser will automatically create a draft release.
+  # Set to false to publish automatically.
+  draft: false
