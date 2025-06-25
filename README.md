@@ -41,7 +41,7 @@ hfget [OPTIONS] REPOSITORY_NAME
 This will download the `Llama-2-7B-GGUF` model from the user `TheBloke` into a directory named `TheBloke_Llama-2-7B-GGUF`.
 
 ```sh
-hfget TheBloke/Llama-2-7B-GGUF
+hfget imdatta0/nanollama
 ```
 
 **2. Download to a Nested Directory**
@@ -49,8 +49,8 @@ hfget TheBloke/Llama-2-7B-GGUF
 Using the `--tree` flag preserves the original repository structure (`organization/model_name`).
 
 ```sh
-# This will save files to a directory named 'TheBloke/Llama-2-7B-GGUF'
-hfget --tree TheBloke/Llama-2-7B-GGUF
+# This will save files to a directory named 'imdatta0/nanollama'
+hfget --tree imdatta0/nanollama
 ```
 
 **3. Download a Dataset**
@@ -67,18 +67,17 @@ Use the `--include` and `--exclude` flags with comma-separated glob patterns to 
 
 ```sh
 # Download only the Q4 and Q5 quantizations from a model
-hfget TheBloke/Llama-2-7B-GGUF --include "*.Q4_K_M.gguf,*.Q5_K_M.gguf"
+hfget imdatta0/nanollama --include "*.Q4_K_M.gguf,*.Q5_K_M.gguf"
 
 # Download everything EXCEPT the safetensors files
-hfget TheBloke/Llama-2-7B-GGUF --exclude "*.safetensors"
+hfget imdatta0/nanollama --exclude "*.safetensors"
 ```
-
 **5. Force a Re-download**
 
 To re-download all files from a repository, regardless of their local state, use the `-f` flag. This will also skip all interactive prompts.
 
 ```sh
-hfget -f TheBloke/Llama-2-7B-GGUF
+hfget -f imdatta0/nanollama
 ```
 
 ### Command-Line Flags

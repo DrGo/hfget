@@ -19,13 +19,14 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "6.1.4" 
+var version = "6.1.4"
 
 const (
 	moveUp    = "\033[A"
 	clearLine = "\r\033[2K"
 )
-// interface to facilitate testing 
+
+// interface to facilitate testing
 type downloader interface {
 	FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, error)
 	BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) (*hfg.DownloadPlan, error)
@@ -45,7 +46,6 @@ func (r *realDownloader) BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) 
 func (r *realDownloader) ExecutePlan(ctx context.Context, plan *hfg.DownloadPlan) error {
 	return r.Downloader.ExecutePlan(ctx, plan)
 }
-
 
 type cliApp struct {
 	out           io.Writer
@@ -143,14 +143,30 @@ func (app *cliApp) run(args []string) error {
 	opts := []hfg.Option{
 		hfg.WithBranch(branch), hfg.WithDestination(storage), hfg.WithConnections(numConnections),
 	}
-	if isDatasetFlag { opts = append(opts, hfg.AsDataset()) }
-	if token != "" { opts = append(opts, hfg.WithAuthToken(token)) }
-	if skipSHA { opts = append(opts, hfg.SkipSHACheck()) }
-	if force { opts = append(opts, hfg.WithForceRedownload()) }
-	if useTree { opts = append(opts, hfg.WithTreeStructure()) }
-	if includePatterns != "" { opts = append(opts, hfg.WithIncludePatterns(strings.Split(includePatterns, ","))) }
-	if excludePatterns != "" { opts = append(opts, hfg.WithExcludePatterns(strings.Split(excludePatterns, ","))) }
-	if verbose { opts = append(opts, hfg.WithVerboseOutput(app.err)) }
+	if isDatasetFlag {
+		opts = append(opts, hfg.AsDataset())
+	}
+	if token != "" {
+		opts = append(opts, hfg.WithAuthToken(token))
+	}
+	if skipSHA {
+		opts = append(opts, hfg.SkipSHACheck())
+	}
+	if force {
+		opts = append(opts, hfg.WithForceRedownload())
+	}
+	if useTree {
+		opts = append(opts, hfg.WithTreeStructure())
+	}
+	if includePatterns != "" {
+		opts = append(opts, hfg.WithIncludePatterns(strings.Split(includePatterns, ",")))
+	}
+	if excludePatterns != "" {
+		opts = append(opts, hfg.WithExcludePatterns(strings.Split(excludePatterns, ",")))
+	}
+	if verbose {
+		opts = append(opts, hfg.WithVerboseOutput(app.err))
+	}
 
 	downloader := app.newDownloader(repoName, opts...)
 
@@ -173,7 +189,7 @@ func (app *cliApp) run(args []string) error {
 		progressChan = make(chan hfg.Progress, numConnections*2)
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
 		downloader = app.newDownloader(repoName, optsWithProgress...)
-		
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -255,7 +271,7 @@ func (app *cliApp) run(args []string) error {
 		progressChan = make(chan hfg.Progress, numConnections*2)
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
 		downloader = app.newDownloader(repoName, optsWithProgress...)
-		
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -310,19 +326,21 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 				return
 			}
 			lastActiveFile = pr.Filepath
-			
+
 			state, exists := fileStates[pr.Filepath]
 			if !exists {
 				state = &fileProgressState{totalSize: pr.TotalSize}
 				fileStates[pr.Filepath] = state
 			}
-			
+
 			// For both verifying and verified/skipped, the value represents progress on that file
 			state.processedBytes = pr.CurrentSize
-			
+
 		case <-ticker.C:
 			width, _, _ := term.GetSize(fd)
-			if width <= 0 { width = 90 }
+			if width <= 0 {
+				width = 90
+			}
 
 			var totalVerifiedBytes int64
 			for _, state := range fileStates {
@@ -333,7 +351,7 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 			if totalAnalysisSize > 0 {
 				percent = (float64(totalVerifiedBytes) * 100) / float64(totalAnalysisSize)
 			}
-			
+
 			if percent > 100.0 {
 				percent = 100.0
 			}
@@ -377,25 +395,36 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 				return
 			}
 			state, exists := fileStates[pr.Filepath]
-			if !exists { continue }
+			if !exists {
+				continue
+			}
 			state.state = pr.State
-
+			// main.go -> downloadDisplayProgress -> select -> case
 			switch pr.State {
 			case hfg.ProgressStateDownloading:
-				state.processedBytes += pr.CurrentSize
-				totalDownloaded += pr.CurrentSize
-				recentBytes += pr.CurrentSize
+				// Calculate the number of new bytes since the last update
+				if pr.CurrentSize > state.processedBytes {
+					delta := pr.CurrentSize - state.processedBytes
+					totalDownloaded += delta
+					recentBytes += delta
+				}
+				// Set the file's progress to the new cumulative value
+				state.processedBytes = pr.CurrentSize
+
 			case hfg.ProgressStateComplete, hfg.ProgressStateVerified:
+				// When a file finishes, ensure it's marked as 100%
 				if state.processedBytes < state.totalSize {
 					delta := state.totalSize - state.processedBytes
 					totalDownloaded += delta
+					// No need to add to recentBytes, as this is a finalization, not a speed measure
 				}
 				state.processedBytes = state.totalSize
 			}
-
 		case <-ticker.C:
 			width, _, _ := term.GetSize(fd)
-			if width <= 0 { width = 90 }
+			if width <= 0 {
+				width = 90
+			}
 
 			if linesPrinted > 0 {
 				fmt.Fprint(out, clearLine)
@@ -423,7 +452,7 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 			} else if firstValidIndex == -1 && len(speedSamples) > 0 && now.Sub(speedSamples[0].t) > 5*time.Second {
 				speedSamples = nil
 			}
-			
+
 			var currentSpeedBytes int64
 			for _, sample := range speedSamples {
 				currentSpeedBytes += sample.bytes
@@ -431,7 +460,9 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 			currentSpeed := float64(currentSpeedBytes) / 5.0
 
 			elapsed := time.Since(downloadStartTime).Seconds()
-			if elapsed < 0.1 { elapsed = 0.1 }
+			if elapsed < 0.1 {
+				elapsed = 0.1
+			}
 			avgSpeed := float64(totalDownloaded) / elapsed
 
 			overallPercent := 0.0
@@ -452,7 +483,7 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 					break
 				}
 			}
-			
+
 			var line2 string
 			if activeState != nil && activeFile != "" {
 				filePercent := 0.0
@@ -464,8 +495,12 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 			} else {
 				line2 = "Finalizing..."
 			}
-			if len(line1) > width { line1 = line1[:width] }
-			if len(line2) > width { line2 = line2[:width] }
+			if len(line1) > width {
+				line1 = line1[:width]
+			}
+			if len(line2) > width {
+				line2 = line2[:width]
+			}
 
 			fmt.Fprintln(out, line1)
 			fmt.Fprint(out, line2)
@@ -482,13 +517,19 @@ func envOrDefault(key, defaultValue string) string {
 }
 
 func isTransientError(err error) bool {
-	if err == nil { return false }
-	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) { return false }
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) {
+		return false
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return netErr.Timeout() || netErr.Temporary()
 	}
-	if strings.Contains(err.Error(), "i/o timeout") { return true }
+	if strings.Contains(err.Error(), "i/o timeout") {
+		return true
+	}
 	return false
 }
 

@@ -102,6 +102,13 @@ type Downloader struct {
 	includePatterns     []string
 	excludePatterns     []string
 	Progress            chan<- Progress
+	progressState map[string]*progressState // Tracks update times per file
+	progressMutex sync.Mutex                // Protects the progressState map
+}
+
+// Add this new struct definition as well, right after the Downloader struct.
+type progressState struct {
+	lastUpdated time.Time
 }
 
 type Option func(*Downloader)
@@ -192,26 +199,20 @@ func (d *Downloader) BuildPlan(ctx context.Context, repoInfo *RepoInfo) (*Downlo
 	return plan, nil
 }
 
-// flattenTree recursively gets all files from a nested structure.
+// flattenTree filters a list of HFFile entries, returning only the actual files.
 func (d *Downloader) flattenTree(files []HFFile) []HFFile {
 	var flatList []HFFile
+	// The Hugging Face API provides a flat list of all files, so we just need
+	// to filter out any entries that are explicitly marked as 'directory'.
 	for _, file := range files {
-		if file.Type == "directory" {
-			// In the new model, we fetch the full tree upfront, so we just recurse.
-			// This part of the logic assumes that fetchRepoInfo gets the entire tree.
-			// If not, API calls would be needed here. For now, assume a full tree.
-		} else {
+		if file.Type != "directory" {
 			flatList = append(flatList, file)
 		}
 	}
-	return files // Assuming fetchRepoInfo provides a flat list of all files.
+	return flatList // Correctly returns the filtered list of files
 }
 
 func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, file HFFile, plan *DownloadPlan) {
-	if file.Type == "directory" {
-		return // We only process files in this function
-	}
-
 	if !d.shouldDownload(file.Path) {
 		d.logger.Printf("Skipping file '%s' due to include/exclude filters.", file.Path)
 		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "filtered")
@@ -219,6 +220,24 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 	}
 
 	fullPath := filepath.Join(modelPath, file.Path)
+
+	// First, get the absolute path of our intended destination root.
+	absModelPath, err := filepath.Abs(modelPath)
+	if err != nil {
+		d.logger.Printf("Security check failed: could not determine absolute path for destination '%s': %v", modelPath, err)
+		return
+	}
+	// Then, get the absolute path of the file we are about to write.
+	absFullPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		d.logger.Printf("Security check failed: could not determine absolute path for file '%s': %v", fullPath, err)
+		return
+	}
+	// Finally, ensure the file's path is truly a child of the destination path.
+	if !strings.HasPrefix(absFullPath, absModelPath) {
+		d.logger.Printf("Security check failed: file '%s' attempts to write outside of destination directory. Skipping.", file.Path)
+		return
+	}
 	if d.forceRedownload {
 		d.logger.Printf("Forcing re-download for: %s", file.Path)
 		plan.FilesToDownload = append(plan.FilesToDownload, FileDownload{File: file, Reason: "forced re-download"})
@@ -249,26 +268,36 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 	for _, fileToDownload := range plan.FilesToDownload {
 		file := fileToDownload.File
 		d.logger.Printf("Starting download of: %s", file.Path)
-		err := d.downloadFile(ctx, modelPath, file)
+
+		calculatedChecksum, err := d.downloadFile(ctx, modelPath, file)
 		if err != nil {
-			errStr := fmt.Sprintf("failed to download %s: %v", file.Path, err)
-			log.Println(errStr)
-			downloadErrors = append(downloadErrors, errStr)
+			d.logger.Printf("failed to download %s: %v", file.Path, err)
+			downloadErrors = append(downloadErrors, fmt.Sprintf("failed to download %s: %v", file.Path, err))
 			continue
 		}
 
 		d.sendProgress(file.Path, ProgressStateComplete, file.Size, file.Size, "Verifying...")
 
-		fullPath := filepath.Join(modelPath, file.Path)
-		verificationMethod, err := d.verifyLocalFile(fullPath, file, true)
-		if err != nil {
-			errStr := fmt.Sprintf("validation failed for %s: %v", file.Path, err)
-			log.Println(errStr)
-			downloadErrors = append(downloadErrors, errStr)
-			continue
+		if calculatedChecksum != "" {
+			if !d.skipSHA && file.LFS.IsLFS && calculatedChecksum != file.LFS.Oid {
+				errStr := fmt.Sprintf("validation failed for %s: checksum mismatch: expected %s, got %s", file.Path, file.LFS.Oid, calculatedChecksum)
+				d.logger.Print(errStr)
+				downloadErrors = append(downloadErrors, errStr)
+				continue
+			}
+			d.logger.Printf("Successfully verified '%s' via on-the-fly SHA256", file.Path)
+			d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "On-the-fly SHA256")
+		} else {
+			fullPath := filepath.Join(modelPath, file.Path)
+			verificationMethod, err := d.verifyLocalFile(fullPath, file, true)
+			if err != nil {
+				d.logger.Printf("validation failed for %s: %v", file.Path, err)
+				downloadErrors = append(downloadErrors, fmt.Sprintf("validation failed for %s: %v", file.Path, err))
+				continue
+			}
+			d.logger.Printf("Successfully verified '%s' via %s", verificationMethod, file.Path)
+			d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, verificationMethod)
 		}
-		d.logger.Printf("Successfully verified '%s' via %s", verificationMethod, file.Path)
-		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, verificationMethod)
 	}
 
 	if len(downloadErrors) > 0 {
@@ -350,36 +379,18 @@ func (d *Downloader) shouldDownload(path string) bool {
 	}
 	return false
 }
+// Add this new function to downloader.go
 
-func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HFFile) error {
-	downloadURL, err := d.resolveDownloadURL(ctx, file)
-	if err != nil {
-		return err
-	}
-	d.logger.Printf("Resolved download URL for '%s': %s", file.Path, downloadURL)
-	fullPath := filepath.Join(modelPath, file.Path)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return err
-	}
-
-	tmpDir := filepath.Join(modelPath, ".tmp")
-
-	if !file.LFS.IsLFS || file.Size < int64(d.numConnections*1024*1024) {
-		d.logger.Printf("Using single-threaded download for %s", file.Path)
-		return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
-	}
-
-	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
+func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, tmpDir string, file HFFile) error {
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
+
+	var downloadedBytes atomic.Int64
 	chunkSize := file.Size / int64(d.numConnections)
 	var wg sync.WaitGroup
 	errChan := make(chan error, d.numConnections)
-
-	// Create a single, shared atomic counter for all chunks of this file.
-	var downloadedBytes atomic.Int64
 
 	for i := range d.numConnections {
 		start := int64(i) * chunkSize
@@ -391,17 +402,17 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 		go func(chunkIndex int, start, end int64) {
 			defer wg.Done()
 			tmpFileName := filepath.Join(tmpDir, fmt.Sprintf("%s_%d.tmp", filepath.Base(file.Path), chunkIndex))
-			// Pass the pointer to the shared counter into downloadChunk
-			if err := d.downloadChunk(ctx, downloadURL, tmpFileName, start, end, file, &downloadedBytes); err != nil {
+			if err := d.downloadChunk(ctx, url, tmpFileName, start, end, file, &downloadedBytes); err != nil {
 				errChan <- fmt.Errorf("chunk %d for %s failed: %w", chunkIndex, file.Path, err)
 			}
 		}(i, start, end)
 	}
 	wg.Wait()
 	close(errChan)
+
 	for err := range errChan {
 		if err != nil {
-			return err
+			return err // Return on first chunk error
 		}
 	}
 
@@ -409,6 +420,33 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections)
 }
 
+// downloadFile now returns a calculated checksum (if available) and an error.
+// Replace the existing downloadFile function with this refactored version.
+
+func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HFFile) (string, error) {
+	downloadURL, err := d.resolveDownloadURL(ctx, file)
+	if err != nil {
+		return "", err
+	}
+	d.logger.Printf("Resolved download URL for '%s': %s", file.Path, downloadURL)
+
+	fullPath := filepath.Join(modelPath, file.Path)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", err
+	}
+
+	// High-level branching logic is now much clearer.
+	if !file.LFS.IsLFS || file.Size < int64(d.numConnections*1024*1024) {
+		d.logger.Printf("Using single-threaded download for %s", file.Path)
+		return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
+	} 
+	
+	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
+	tmpDir := filepath.Join(modelPath, ".tmp")
+	err = d.downloadMultiThreaded(ctx, downloadURL, fullPath, tmpDir, file)
+	// Return empty checksum, signaling that post-download verification is needed.
+	return "", err
+}
 // Add progressCounter *atomic.Int64 to the function signature
 func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile, progressCounter *atomic.Int64) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -446,51 +484,89 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
-func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath string, file HFFile) error {
+// downloadSingleThreaded now returns the calculated SHA256 checksum as a hex string.
+func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath string, file HFFile) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if d.authToken != "" {
 		req.Header.Add("Authorization", "Bearer "+d.authToken)
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
+		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 	out, err := os.Create(fullPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer out.Close()
 
-	// Create a new counter for this download.
 	var downloadedBytes atomic.Int64
-
 	idleReader := NewSafeIdleTimeoutReader(resp.Body, 60*time.Second)
+
+	// Create a new hasher
+	hasher := sha256.New()
+	// Create a MultiWriter to write to both the file (out) and the hasher simultaneously.
+	writer := io.MultiWriter(out, hasher)
+
 	progressWriter := &progressWriter{
 		filepath:     file.Path,
 		totalSize:    file.Size,
-		w:            out,
+		w:            writer, // Use the MultiWriter as the destination
 		d:            d,
-		bytesWritten: &downloadedBytes, // Pass the counter's pointer.
+		bytesWritten: &downloadedBytes,
 	}
 
-	_, err = io.Copy(progressWriter, idleReader)
-	return err
-}
+	if _, err = io.Copy(progressWriter, idleReader); err != nil {
+		return "", err
+	}
 
+	// Calculate the final checksum and return it.
+	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
+	return actualChecksum, nil
+}
 func (d *Downloader) sendProgress(filepath string, state ProgressState, current, total int64, msg string) {
 	if d.Progress == nil {
 		return
 	}
 
-	// Create the progress update struct.
+	throttleInterval := 100 * time.Millisecond
+
+	d.progressMutex.Lock()
+	// Initialize the map on first use.
+	if d.progressState == nil {
+		d.progressState = make(map[string]*progressState)
+	}
+	// Get or create a state tracker for this specific file.
+	if _, ok := d.progressState[filepath]; !ok {
+		d.progressState[filepath] = &progressState{}
+	}
+	fileState := d.progressState[filepath]
+
+	isFinalState := (state == ProgressStateComplete || state == ProgressStateVerified)
+	// --- NEW LOGIC HERE ---
+	// Also consider a download 100% complete as a final, non-throttled state.
+	isDownloadComplete := (state == ProgressStateDownloading && current == total)
+
+	// Throttle the update if it's not a final state, not a 100% download update,
+	// not the first update, AND not enough time has passed.
+	if !isFinalState && !isDownloadComplete && !fileState.lastUpdated.IsZero() && time.Since(fileState.lastUpdated) < throttleInterval {
+		d.progressMutex.Unlock()
+		return // Skip sending this update.
+	}
+
+	// If we are sending, update the timestamp.
+	fileState.lastUpdated = time.Now()
+	d.progressMutex.Unlock()
+
+
 	progressUpdate := Progress{
 		Filepath:    filepath,
 		State:       state,
@@ -499,13 +575,12 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 		Message:     msg,
 	}
 
-	// Use a non-blocking select to send the progress update.
+	// Use the non-blocking send.
 	select {
 	case d.Progress <- progressUpdate:
 		// The update was sent successfully.
 	default:
-		// The channel was blocked (likely full or has no receiver).
-		// We drop the update to prevent the downloader from hanging.
+		// The channel was blocked. Drop the update to prevent hanging.
 	}
 }
 func mergeFiles(outputFileName, tempDir, baseName string, numChunks int) error {
