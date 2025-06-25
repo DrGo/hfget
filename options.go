@@ -41,6 +41,38 @@ func WithDestination(dest string) Option {
 	}
 }
 
+// Add these functions to downloader.go
+
+// WithInclude sets the include glob patterns for filtering files.
+func WithInclude(patterns ...string) Option {
+	return func(d *Downloader) {
+		d.includePatterns = patterns
+	}
+}
+
+// WithExclude sets the exclude glob patterns for filtering files.
+func WithExclude(patterns ...string) Option {
+	return func(d *Downloader) {
+		d.excludePatterns = patterns
+	}
+}
+
+// WithNumConnections sets the number of parallel connections for multi-threaded downloads.
+func WithNumConnections(n int) Option {
+	return func(d *Downloader) {
+		if n > 0 {
+			d.numConnections = n
+		}
+	}
+}
+
+// WithProgress sets the channel for progress reporting.
+func WithProgress(ch chan<- Progress) Option {
+	return func(d *Downloader) {
+		d.Progress = ch
+	}
+}
+
 // AsDataset specifies that the repository is a dataset.
 func AsDataset() Option {
 	return func(d *Downloader) {

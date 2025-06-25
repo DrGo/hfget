@@ -13,33 +13,30 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// idleTimeoutReader wraps an io.ReadCloser and times out if no data is read
-// for a specified duration.
-type idleTimeoutReader struct {
+// SafeIdleTimeoutReader wraps an io.ReadCloser and is safe for concurrent use.
+// It returns a timeout error if any single Read call takes longer than the timeout duration.
+type SafeIdleTimeoutReader struct {
 	r       io.ReadCloser
 	timeout time.Duration
-	timer   *time.Timer
 }
 
-func newIdleTimeoutReader(r io.ReadCloser, timeout time.Duration) *idleTimeoutReader {
-	return &idleTimeoutReader{
+// NewSafeIdleTimeoutReader creates a new reader with a specified idle timeout.
+func NewSafeIdleTimeoutReader(r io.ReadCloser, timeout time.Duration) *SafeIdleTimeoutReader {
+	return &SafeIdleTimeoutReader{
 		r:       r,
 		timeout: timeout,
-		timer:   time.NewTimer(timeout),
 	}
 }
 
-func (itr *idleTimeoutReader) Read(p []byte) (n int, err error) {
-	if !itr.timer.Stop() {
-		select {
-		case <-itr.timer.C:
-		default:
-		}
-	}
-	itr.timer.Reset(itr.timeout)
+// Read implements the io.Reader interface with an idle timeout.
+func (r *SafeIdleTimeoutReader) Read(p []byte) (n int, err error) {
+	// Create a context that will be cancelled when the timeout is reached.
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	defer cancel() // Ensure the context resources are always released.
 
 	type readResult struct {
 		n   int
@@ -47,24 +44,25 @@ func (itr *idleTimeoutReader) Read(p []byte) (n int, err error) {
 	}
 	resultCh := make(chan readResult, 1)
 
+	// Launch the blocking Read operation in a separate goroutine.
 	go func() {
-		n, err := itr.r.Read(p)
+		n, err := r.r.Read(p)
 		resultCh <- readResult{n, err}
 	}()
 
 	select {
-	case <-itr.timer.C:
-		return 0, fmt.Errorf("i/o timeout after %v of inactivity", itr.timeout)
+	case <-ctx.Done():
+		// The context's deadline was exceeded. The most common error here is context.DeadlineExceeded.
+		return 0, ctx.Err()
 	case result := <-resultCh:
+		// The read operation completed successfully or with its own error.
 		return result.n, result.err
 	}
 }
 
-func (itr *idleTimeoutReader) Close() error {
-	if itr.timer != nil {
-		itr.timer.Stop()
-	}
-	return itr.r.Close()
+// Close implements the io.Closer interface.
+func (r *SafeIdleTimeoutReader) Close() error {
+	return r.r.Close()
 }
 
 // DownloadPlan holds a detailed summary of actions to be taken.
@@ -376,10 +374,12 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-
 	chunkSize := file.Size / int64(d.numConnections)
 	var wg sync.WaitGroup
 	errChan := make(chan error, d.numConnections)
+
+	// Create a single, shared atomic counter for all chunks of this file.
+	var downloadedBytes atomic.Int64
 
 	for i := range d.numConnections {
 		start := int64(i) * chunkSize
@@ -391,14 +391,14 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 		go func(chunkIndex int, start, end int64) {
 			defer wg.Done()
 			tmpFileName := filepath.Join(tmpDir, fmt.Sprintf("%s_%d.tmp", filepath.Base(file.Path), chunkIndex))
-			if err := d.downloadChunk(ctx, downloadURL, tmpFileName, start, end, file); err != nil {
+			// Pass the pointer to the shared counter into downloadChunk
+			if err := d.downloadChunk(ctx, downloadURL, tmpFileName, start, end, file, &downloadedBytes); err != nil {
 				errChan <- fmt.Errorf("chunk %d for %s failed: %w", chunkIndex, file.Path, err)
 			}
 		}(i, start, end)
 	}
 	wg.Wait()
 	close(errChan)
-
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -409,7 +409,8 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections)
 }
 
-func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile) error {
+// Add progressCounter *atomic.Int64 to the function signature
+func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile, progressCounter *atomic.Int64) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
@@ -433,18 +434,18 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 	}
 	defer out.Close()
 
-	idleReader := newIdleTimeoutReader(resp.Body, 60*time.Second)
+	idleReader := NewSafeIdleTimeoutReader(resp.Body, 60*time.Second)
 	progressWriter := &progressWriter{
-		filepath:  file.Path,
-		totalSize: file.Size,
-		w:         out,
-		d:         d,
+		filepath:     file.Path,
+		totalSize:    file.Size,
+		w:            out,
+		d:            d,
+		bytesWritten: progressCounter, // Use the passed-in shared counter
 	}
 
 	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
-
 func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath string, file HFFile) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -468,12 +469,16 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	}
 	defer out.Close()
 
-	idleReader := newIdleTimeoutReader(resp.Body, 60*time.Second)
+	// Create a new counter for this download.
+	var downloadedBytes atomic.Int64
+
+	idleReader := NewSafeIdleTimeoutReader(resp.Body, 60*time.Second)
 	progressWriter := &progressWriter{
-		filepath:  file.Path,
-		totalSize: file.Size,
-		w:         out,
-		d:         d,
+		filepath:     file.Path,
+		totalSize:    file.Size,
+		w:            out,
+		d:            d,
+		bytesWritten: &downloadedBytes, // Pass the counter's pointer.
 	}
 
 	_, err = io.Copy(progressWriter, idleReader)
@@ -484,22 +489,32 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 	if d.Progress == nil {
 		return
 	}
-	d.Progress <- Progress{
+
+	// Create the progress update struct.
+	progressUpdate := Progress{
 		Filepath:    filepath,
 		State:       state,
 		CurrentSize: current,
 		TotalSize:   total,
 		Message:     msg,
 	}
-}
 
+	// Use a non-blocking select to send the progress update.
+	select {
+	case d.Progress <- progressUpdate:
+		// The update was sent successfully.
+	default:
+		// The channel was blocked (likely full or has no receiver).
+		// We drop the update to prevent the downloader from hanging.
+	}
+}
 func mergeFiles(outputFileName, tempDir, baseName string, numChunks int) error {
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
 		return err
 	}
 	defer outputFile.Close()
-	for i := range numChunks{
+	for i := range numChunks {
 		tmpFileName := filepath.Join(tempDir, fmt.Sprintf("%s_%d.tmp", baseName, i))
 		tmpFile, err := os.Open(tmpFileName)
 		if err != nil {
@@ -546,16 +561,20 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 }
 
 type progressWriter struct {
-	w         io.Writer
-	filepath  string
-	totalSize int64
-	d         *Downloader
+	w            io.Writer
+	filepath     string
+	totalSize    int64
+	d            *Downloader
+	bytesWritten *atomic.Int64 // Pointer to a shared counter
 }
 
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
 	n, err = pw.w.Write(p)
 	if n > 0 && pw.d != nil {
-		pw.d.sendProgress(pw.filepath, ProgressStateDownloading, int64(n), pw.totalSize, "")
+		// Add the number of bytes from this write to the shared counter.
+		newTotal := pw.bytesWritten.Add(int64(n))
+		// Send a progress update with the new CUMULATIVE total for the file.
+		pw.d.sendProgress(pw.filepath, ProgressStateDownloading, newTotal, pw.totalSize, "")
 	}
 	return
 }
