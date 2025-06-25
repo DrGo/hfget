@@ -19,13 +19,13 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "6.1.4" // Final version
+var version = "6.1.4" 
 
 const (
 	moveUp    = "\033[A"
 	clearLine = "\r\033[2K"
 )
-
+// interface to facilitate testing 
 type downloader interface {
 	FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, error)
 	BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) (*hfg.DownloadPlan, error)
@@ -57,12 +57,10 @@ type cliApp struct {
 
 func main() {
 	fd := int(os.Stderr.Fd())
-	isTerm := term.IsTerminal(fd)
-
 	app := &cliApp{
 		out:        os.Stdout,
 		err:        os.Stderr,
-		isTerminal: isTerm,
+		isTerminal: term.IsTerminal(fd),
 		terminalFd: fd,
 		newDownloader: func(repoName string, opts ...hfg.Option) downloader {
 			return &realDownloader{Downloader: hfg.New(repoName, opts...)}
@@ -134,7 +132,6 @@ func (app *cliApp) run(args []string) error {
 	}
 
 	if fs.NArg() < 1 {
-		fs.Usage()
 		return errors.New("a model or dataset name argument is required")
 	}
 	repoName := fs.Arg(0)

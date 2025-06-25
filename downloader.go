@@ -28,21 +28,18 @@ func newIdleTimeoutReader(r io.ReadCloser, timeout time.Duration) *idleTimeoutRe
 	return &idleTimeoutReader{
 		r:       r,
 		timeout: timeout,
+		timer:   time.NewTimer(timeout),
 	}
 }
 
 func (itr *idleTimeoutReader) Read(p []byte) (n int, err error) {
-	if itr.timer == nil {
-		itr.timer = time.NewTimer(itr.timeout)
-	} else {
-		if !itr.timer.Stop() {
-			select {
-			case <-itr.timer.C:
-			default:
-			}
+	if !itr.timer.Stop() {
+		select {
+		case <-itr.timer.C:
+		default:
 		}
-		itr.timer.Reset(itr.timeout)
 	}
+	itr.timer.Reset(itr.timeout)
 
 	type readResult struct {
 		n   int
@@ -384,7 +381,7 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	var wg sync.WaitGroup
 	errChan := make(chan error, d.numConnections)
 
-	for i := 0; i < d.numConnections; i++ {
+	for i := range d.numConnections {
 		start := int64(i) * chunkSize
 		end := start + chunkSize - 1
 		if i == d.numConnections-1 {
@@ -502,7 +499,7 @@ func mergeFiles(outputFileName, tempDir, baseName string, numChunks int) error {
 		return err
 	}
 	defer outputFile.Close()
-	for i := 0; i < numChunks; i++ {
+	for i := range numChunks{
 		tmpFileName := filepath.Join(tempDir, fmt.Sprintf("%s_%d.tmp", baseName, i))
 		tmpFile, err := os.Open(tmpFileName)
 		if err != nil {
