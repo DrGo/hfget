@@ -27,7 +27,7 @@ help:
 ## build: builds the application binary into the ./bin directory
 build:
 	@echo "--- Building $(BINARY_NAME) version $(VERSION)..."
-	@go build -ldflags="-s -w -X main.VERSION=$(VERSION)" -o bin/$(BINARY_NAME) $(CMD_PATH)
+	@go build -ldflags="-s -w -X main.VERSION=$(VERSION)" -o dist/$(BINARY_NAME) $(CMD_PATH)
 
 ## install: builds and installs the application into your Go bin path
 install:
@@ -51,7 +51,6 @@ tag:
 ## clean: removes build artifacts
 clean:
 	@echo "--- Cleaning up..."
-	@rm -rf ./bin
 	@rm -rf ./dist
 
 .PHONY: help build install tag clean
