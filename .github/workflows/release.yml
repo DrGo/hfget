@@ -29,7 +29,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # Corrected: Read the Go version from the go.mod file for maintainability.
+          # Read the Go version from the go.mod file for maintainability.
           go-version-file: 'go.mod'
 
       # Step 3: Run GoReleaser.
