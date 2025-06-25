@@ -12,11 +12,15 @@ import (
 	hfg "github.com/drgo/hfget"
 )
 
-// mockDownloader implements the new downloader interface for testing the CLI app.
+// --- FIX 1: Updated mockDownloader with specific error fields ---
 type mockDownloader struct {
 	repoInfoToReturn *hfg.RepoInfo
 	planToReturn     *hfg.DownloadPlan
-	errToReturn      error
+
+	// Specific errors for each phase
+	fetchErr   error
+	buildErr   error
+	executeErr error
 
 	// Track calls
 	fetchRepoInfoCalls int
@@ -30,23 +34,23 @@ type mockDownloader struct {
 func (m *mockDownloader) FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, error) {
 	m.fetchRepoInfoCalls++
 	if m.repoInfoToReturn == nil {
-		return &hfg.RepoInfo{ID: "test/repo"}, m.errToReturn
+		return &hfg.RepoInfo{ID: "test/repo"}, m.fetchErr
 	}
-	return m.repoInfoToReturn, m.errToReturn
+	return m.repoInfoToReturn, m.fetchErr
 }
 
 func (m *mockDownloader) BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) (*hfg.DownloadPlan, error) {
 	m.buildPlanCalls++
 	if m.planToReturn == nil {
-		return &hfg.DownloadPlan{Repo: repoInfo}, m.errToReturn
+		return &hfg.DownloadPlan{Repo: repoInfo}, m.buildErr
 	}
-	return m.planToReturn, m.errToReturn
+	return m.planToReturn, m.buildErr
 }
 
 func (m *mockDownloader) ExecutePlan(ctx context.Context, plan *hfg.DownloadPlan) error {
 	m.executePlanCalls++
 	if m.executePlanCalls <= m.executePlanFailures {
-		return m.errToReturn
+		return m.executeErr
 	}
 	return nil
 }
@@ -145,7 +149,7 @@ func TestCLI(t *testing.T) {
 	})
 
 	t.Run("Interactive prompt to re-download", func(t *testing.T) {
-		restore := mockStdin(t, "y\n") // Simulate "y" then "y" for the second prompt
+		restore := mockStdin(t, "y\ny\n") // Simulate "y" for re-download and "y" for confirmation
 		defer restore()
 
 		out := &bytes.Buffer{}
@@ -159,16 +163,14 @@ func TestCLI(t *testing.T) {
 			repoInfoToReturn: defaultRepoInfo,
 			planToReturn:     emptyPlan,
 		}
+		// --- FIX 2: Set isTerminal to true for this test ---
 		app := &cliApp{
 			out:           out,
 			err:           errOut,
+			isTerminal:    true, // This ensures prompts are shown
 			newDownloader: func(string, ...hfg.Option) downloader { return mock },
 		}
 
-		// This will prompt for re-download, then for confirmation
-		// Need to provide a second "y" for the actual download confirmation
-		restore2 := mockStdin(t, "y\ny\n")
-		defer restore2()
 		err := app.run([]string{"test/repo"})
 		if err != nil {
 			t.Fatalf("Expected no error after re-download confirmation, got: %v", err)
@@ -184,11 +186,11 @@ func TestCLI(t *testing.T) {
 	})
 
 	t.Run("Retry on transient error", func(t *testing.T) {
-		// This mock will fail ExecutePlan once with a transient error, then succeed.
+		// --- FIX 1: Set executeErr instead of the general errToReturn ---
 		mock := &mockDownloader{
 			repoInfoToReturn:    defaultRepoInfo,
 			planToReturn:        defaultPlan,
-			errToReturn:         os.ErrDeadlineExceeded, // A generic transient error
+			executeErr:          os.ErrDeadlineExceeded, // A generic transient error
 			executePlanFailures: 1,                      // Fail on the first attempt
 		}
 		app := &cliApp{
@@ -212,10 +214,11 @@ func TestCLI(t *testing.T) {
 	})
 
 	t.Run("No retry on fatal error", func(t *testing.T) {
+		// --- FIX 1: Set executeErr instead of the general errToReturn ---
 		mock := &mockDownloader{
 			repoInfoToReturn:    defaultRepoInfo,
 			planToReturn:        defaultPlan,
-			errToReturn:         hfg.ErrAuthentication, // A fatal error
+			executeErr:          hfg.ErrAuthentication, // A fatal error
 			executePlanFailures: 1,
 		}
 		app := &cliApp{

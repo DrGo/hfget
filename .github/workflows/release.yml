@@ -29,8 +29,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # Specify the version of Go to use.
-          go-version: 1.21
+          # Corrected: Read the Go version from the go.mod file for maintainability.
+          go-version-file: 'go.mod'
 
       # Step 3: Run GoReleaser.
       # This is the core step that builds and releases the application.
@@ -39,55 +39,11 @@ jobs:
         with:
           # The version of GoReleaser to use. 'latest' is recommended.
           version: latest
-          # The command to run. 'release' is the default.
-          args: release --clean
-        env:
-          # The GITHUB_TOKEN is a special secret provided by GitHub Actions.
-          # It's required for GoReleaser to create releases on your repository.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}# .github/workflows/release.yml
-# This GitHub Actions workflow automates the release process.
-
-name: Release hfget
-
-# This workflow runs on pushes to the repository.
-on:
-  push:
-    # It only runs for tags that look like a version number (e.g., v1.0.0, v4.2.0)
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel.
-jobs:
-  # The "goreleaser" job handles the entire release process.
-  goreleaser:
-    # The type of runner that the job will run on.
-    runs-on: ubuntu-latest
-    # Steps represent a sequence of tasks that will be executed as part of the job.
-    steps:
-      # Step 1: Check out the repository code.
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # fetch-depth: 0 is required for GoReleaser to access git history and tags.
-          fetch-depth: 0
-
-      # Step 2: Set up the Go programming environment.
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          # Specify the version of Go to use.
-          go-version: 1.21
-
-      # Step 3: Run GoReleaser.
-      # This is the core step that builds and releases the application.
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
-        with:
-          # The version of GoReleaser to use. 'latest' is recommended.
-          version: latest
-          # The command to run. 'release' is the default.
+          # The command to run. 'release' is the default. The --clean flag removes
+          # the dist folder before building, ensuring a clean release.
           args: release --clean
         env:
           # The GITHUB_TOKEN is a special secret provided by GitHub Actions.
           # It's required for GoReleaser to create releases on your repository.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

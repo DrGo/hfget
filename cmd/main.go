@@ -19,7 +19,7 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "6.1.4"
+var VERSION = ""
 
 const (
 	moveUp    = "\033[A"
@@ -76,13 +76,16 @@ func (app *cliApp) run(args []string) error {
 	log.SetOutput(app.err)
 	log.SetFlags(0)
 
+	// --- FIX: Create a single reader to be used for all prompts ---
+	stdinReader := bufio.NewReader(os.Stdin)
+
 	var (
 		isDatasetFlag   bool
 		branch          string
-		storage         string
+		dest            string
 		numConnections  int
 		token           string
-		skipSHA         bool
+		skipChecksum    bool
 		maxRetries      int
 		retryInterval   time.Duration
 		quiet           bool
@@ -97,14 +100,14 @@ func (app *cliApp) run(args []string) error {
 	fs := flag.NewFlagSet("hfget", flag.ContinueOnError)
 	fs.SetOutput(app.err)
 
-	fs.BoolVar(&isDatasetFlag, "d", false, "Specify that the repo is a dataset")
+	fs.BoolVar(&isDatasetFlag, "dataset", false, "Specify that the repo is a dataset")
 	fs.StringVar(&branch, "b", envOrDefault("HFGET_BRANCH", "main"), "Branch of the model or dataset ($HFGET_BRANCH)")
-	fs.StringVar(&storage, "s", envOrDefault("HFGET_STORAGE", "./"), "Storage path for downloads ($HFGET_STORAGE)")
+	fs.StringVar(&dest, "d", envOrDefault("HFGET_DEST", "./"), "Destination path for downloads ($HFGET_DEST)")
 	defaultConnections, _ := strconv.Atoi(envOrDefault("HFGET_CONCURRENT_CONNECTIONS", "5"))
 	fs.IntVar(&numConnections, "c", defaultConnections, "Number of concurrent connections ($HFGET_CONCURRENT_CONNECTIONS)")
 	fs.StringVar(&token, "t", envOrDefault("HFGET_TOKEN", ""), "HuggingFace Auth Token ($HFGET_TOKEN)")
-	defaultSkipSHA, _ := strconv.ParseBool(envOrDefault("HFGET_SKIP_SHA", "false"))
-	fs.BoolVar(&skipSHA, "k", defaultSkipSHA, "Skip SHA256 hash check ($HFGET_SKIP_SHA)")
+	defaultSkipChecksum, _ := strconv.ParseBool(envOrDefault("HFGET_SKIP_CHECKSUM", "false"))
+	fs.BoolVar(&skipChecksum, "skip-checksum", defaultSkipChecksum, "Skip SHA256 checksum verification ($HFGET_SKIP_CHECKSUM)")
 	fs.IntVar(&maxRetries, "max-retries", 3, "Maximum number of retries")
 	fs.DurationVar(&retryInterval, "retry-interval", 5*time.Second, "Interval between retries")
 	fs.BoolVar(&quiet, "q", false, "Quiet mode (suppress progress display and prompts)")
@@ -127,7 +130,7 @@ func (app *cliApp) run(args []string) error {
 	}
 
 	if showVersion {
-		fmt.Fprintf(app.out, "hfget version %s\n", version)
+		fmt.Fprintf(app.out, "hfget version %s\n", VERSION)
 		return nil
 	}
 
@@ -141,7 +144,7 @@ func (app *cliApp) run(args []string) error {
 	}
 
 	opts := []hfg.Option{
-		hfg.WithBranch(branch), hfg.WithDestination(storage), hfg.WithConnections(numConnections),
+		hfg.WithBranch(branch), hfg.WithDestination(dest), hfg.WithConnections(numConnections),
 	}
 	if isDatasetFlag {
 		opts = append(opts, hfg.AsDataset())
@@ -149,7 +152,7 @@ func (app *cliApp) run(args []string) error {
 	if token != "" {
 		opts = append(opts, hfg.WithAuthToken(token))
 	}
-	if skipSHA {
+	if skipChecksum {
 		opts = append(opts, hfg.SkipSHACheck())
 	}
 	if force {
@@ -214,8 +217,8 @@ func (app *cliApp) run(args []string) error {
 
 		if !force && !quiet {
 			fmt.Fprint(app.err, "Would you like to force a re-download anyway? [y/N]: ")
-			reader := bufio.NewReader(os.Stdin)
-			input, _ := reader.ReadString('\n')
+			// --- FIX: Use the shared reader ---
+			input, _ := stdinReader.ReadString('\n')
 			if strings.TrimSpace(strings.ToLower(input)) == "y" {
 				log.Println("Forcing re-download as requested...")
 				for _, skippedFile := range plan.FilesToSkip {
@@ -259,8 +262,8 @@ func (app *cliApp) run(args []string) error {
 		fmt.Fprintf(app.err, "Total download size: %s\n", formatBytes(plan.TotalDownloadSize))
 		fmt.Fprint(app.err, "Proceed with download? [y/N]: ")
 
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
+		// --- FIX: Use the shared reader ---
+		input, _ := stdinReader.ReadString('\n')
 		if strings.TrimSpace(strings.ToLower(input)) != "y" {
 			log.Println("Download cancelled by user.")
 			return nil
@@ -333,7 +336,6 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 				fileStates[pr.Filepath] = state
 			}
 
-			// For both verifying and verified/skipped, the value represents progress on that file
 			state.processedBytes = pr.CurrentSize
 
 		case <-ticker.C:
@@ -399,27 +401,24 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 				continue
 			}
 			state.state = pr.State
-			// main.go -> downloadDisplayProgress -> select -> case
+
 			switch pr.State {
 			case hfg.ProgressStateDownloading:
-				// Calculate the number of new bytes since the last update
 				if pr.CurrentSize > state.processedBytes {
 					delta := pr.CurrentSize - state.processedBytes
 					totalDownloaded += delta
 					recentBytes += delta
 				}
-				// Set the file's progress to the new cumulative value
 				state.processedBytes = pr.CurrentSize
 
 			case hfg.ProgressStateComplete, hfg.ProgressStateVerified:
-				// When a file finishes, ensure it's marked as 100%
 				if state.processedBytes < state.totalSize {
 					delta := state.totalSize - state.processedBytes
 					totalDownloaded += delta
-					// No need to add to recentBytes, as this is a finalization, not a speed measure
 				}
 				state.processedBytes = state.totalSize
 			}
+
 		case <-ticker.C:
 			width, _, _ := term.GetSize(fd)
 			if width <= 0 {
@@ -559,3 +558,4 @@ func truncateString(s string, maxLen int) string {
 	}
 	return "..." + s[len(s)-maxLen+3:]
 }
+
