@@ -41,7 +41,7 @@ archives:
     # Files to include in the archive besides the binary.
     files:
       - README.md
-      - LICENSE # <-- Make sure you have a LICENSE file
+      - LICENSE
 
 # The `checksum` section generates a file with SHA256 checksums for all artifacts.
 checksum:
