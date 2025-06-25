@@ -1,3 +1,4 @@
+version: 2
 
 project_name: hfget
 
@@ -51,4 +52,4 @@ checksum:
 release:
   # If set to true, GoReleaser will automatically create a draft release.
   # Set to false to publish automatically.
-  draft: false
+  draft: true
