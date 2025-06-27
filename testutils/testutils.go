@@ -1,6 +1,7 @@
-// Package testutil provides minimal assertion and requirement helpers for Go tests without external dependencies.
+// Package testutils provides minimal assertion and requirement helpers for Go tests without external dependencies.
 // It offers commonly used functions similar to testify's assert and require packages.
-package testutil
+package testutils
+
 
 import (
 	"fmt"

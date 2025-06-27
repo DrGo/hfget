@@ -1,6 +1,3 @@
-# Makefile for hfget
-
-# === Variables ===
 # The single source of truth for the version number, read from the VERSION file.
 VERSION := $(shell sed 's/ / /g' VERSION)
 
@@ -14,8 +11,6 @@ GOBIN=$(shell go env GOBIN)
 ifeq ($(GOBIN),)
     GOBIN=$(GOPATH)/bin
 endif
-
-# === Targets ===
 
 ## help: prints this help message
 help:
@@ -46,7 +41,6 @@ tag:
 	@echo "--- Pushing commit and tag to origin..."
 	@git push origin main
 	@git push origin $(VERSION)
-	@echo "--- Tag $(VERSION) pushed successfully. GitHub Actions will now create the release."
 
 ## clean: removes build artifacts
 clean:

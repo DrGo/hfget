@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	testutils "github.com/drgo/hfget/testutils"
+	 "github.com/drgo/hfget/testutils"
 )
 
 const (
@@ -30,11 +30,9 @@ type mockFile struct {
 }
 
 // setupMockServer now accepts a map of mock files to serve.
-// Replace the existing setupMockServer with this corrected version
 func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// API and tree endpoints remain the same
 		if strings.Contains(r.URL.Path, "/tree/") {
 			var treeJSON []string
 			for _, f := range files {
@@ -76,7 +74,6 @@ func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 				return
 			}
 
-			// ***FIX STARTS HERE***
 			// Check for Range header to handle chunked downloads
 			rangeHeader := r.Header.Get("Range")
 			if rangeHeader != "" {
@@ -97,7 +94,6 @@ func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 				_, _ = w.Write([]byte(f.Content[start : end+1]))
 				return
 			}
-			// ***FIX ENDS HERE***
 
 			// Fallback for full file downloads
 			w.WriteHeader(http.StatusOK)

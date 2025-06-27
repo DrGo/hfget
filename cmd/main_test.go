@@ -10,9 +10,9 @@ import (
 	"time"
 
 	hfg "github.com/drgo/hfget"
+	"github.com/drgo/hfget/testutils"
 )
 
-// --- FIX 1: Updated mockDownloader with specific error fields ---
 type mockDownloader struct {
 	repoInfoToReturn *hfg.RepoInfo
 	planToReturn     *hfg.DownloadPlan
@@ -87,17 +87,16 @@ func TestCLI(t *testing.T) {
 	}
 
 	t.Run("Missing repository argument", func(t *testing.T) {
+		require := testutils.NewRequire(t)
 		app := &cliApp{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
 		err := app.run([]string{})
-		if err == nil {
-			t.Fatal("Expected an error for missing argument, but got none")
-		}
-		if !strings.Contains(err.Error(), "argument is required") {
-			t.Errorf("Expected error message to contain 'argument is required', got: %v", err)
-		}
+		require.Error(err, "Expected an error for missing argument, but got none")
+		require.True(strings.Contains(err.Error(), "argument is required"), "Expected error message to contain 'argument is required', got: %v", err)
 	})
 
 	t.Run("Force flag implies quiet and skips prompt", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
 		out := &bytes.Buffer{}
 		mock := &mockDownloader{
 			repoInfoToReturn: defaultRepoInfo,
@@ -111,19 +110,15 @@ func TestCLI(t *testing.T) {
 
 		// Use -f for force
 		err := app.run([]string{"-f", "test/repo"})
-		if err != nil {
-			t.Fatalf("Expected no error for forced download, got: %v", err)
-		}
+		require.NoError(err, "Expected no error for forced download, got: %v", err)
 		// There should be no interactive prompt in the output
-		if strings.Contains(out.String(), "Proceed with download? [y/N]:") {
-			t.Error("Expected force flag to skip the confirmation prompt")
-		}
-		if mock.executePlanCalls != 1 {
-			t.Errorf("Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
-		}
+		assert.False(strings.Contains(out.String(), "Proceed with download? [y/N]:"), "Expected force flag to skip the confirmation prompt")
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
 	})
 
 	t.Run("No files to download, exits gracefully", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
 		out := &bytes.Buffer{}
 		emptyPlan := &hfg.DownloadPlan{FilesToDownload: []hfg.FileDownload{}}
 		mock := &mockDownloader{
@@ -137,18 +132,14 @@ func TestCLI(t *testing.T) {
 		}
 
 		err := app.run([]string{"test/repo"})
-		if err != nil {
-			t.Fatalf("Expected no error when no files need downloading, got: %v", err)
-		}
-		if !strings.Contains(app.err.(*bytes.Buffer).String(), "Nothing to download.") {
-			t.Error("Expected to see the 'Nothing to download' message")
-		}
-		if mock.executePlanCalls != 0 {
-			t.Errorf("Expected ExecutePlan to not be called, but was called %d times", mock.executePlanCalls)
-		}
+		require.NoError(err, "Expected no error when no files need downloading, got: %v", err)
+		assert.True(strings.Contains(app.err.(*bytes.Buffer).String(), "Nothing to download."), "Expected to see the 'Nothing to download' message")
+		assert.True(mock.executePlanCalls == 0, "Expected ExecutePlan to not be called, but was called %d times", mock.executePlanCalls)
 	})
 
 	t.Run("Interactive prompt to re-download", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
 		restore := mockStdin(t, "y\ny\n") // Simulate "y" for re-download and "y" for confirmation
 		defer restore()
 
@@ -172,20 +163,16 @@ func TestCLI(t *testing.T) {
 		}
 
 		err := app.run([]string{"test/repo"})
-		if err != nil {
-			t.Fatalf("Expected no error after re-download confirmation, got: %v", err)
-		}
+		require.NoError(err, "Expected no error after re-download confirmation, got: %v", err)
 
-		if !strings.Contains(errOut.String(), "Would you like to force a re-download anyway?") {
-			t.Error("Expected the interactive re-download prompt to be shown")
-		}
+		assert.True(strings.Contains(errOut.String(), "Would you like to force a re-download anyway?"), "Expected the interactive re-download prompt to be shown")
 		// The plan is modified in-place, so ExecutePlan will be called.
-		if mock.executePlanCalls != 1 {
-			t.Errorf("Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
-		}
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
 	})
 
 	t.Run("Retry on transient error", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
 		// --- FIX 1: Set executeErr instead of the general errToReturn ---
 		mock := &mockDownloader{
 			repoInfoToReturn:    defaultRepoInfo,
@@ -201,19 +188,15 @@ func TestCLI(t *testing.T) {
 
 		// Use a very short retry interval for the test and force flag to skip prompts
 		err := app.run([]string{"--retry-interval", "1ms", "-f", "test/repo"})
-		if err != nil {
-			t.Fatalf("Expected no final error after retry, got: %v", err)
-		}
+		require.NoError(err, "Expected no final error after retry, got: %v", err)
 
-		if mock.executePlanCalls != 2 {
-			t.Errorf("Expected ExecutePlan to be called 2 times, but was called %d times", mock.executePlanCalls)
-		}
-		if !strings.Contains(app.err.(*bytes.Buffer).String(), "Retrying after transient error") {
-			t.Error("Expected to see the retry attempt message in the logs")
-		}
+		assert.True(mock.executePlanCalls == 2, "Expected ExecutePlan to be called 2 times, but was called %d times", mock.executePlanCalls)
+		assert.True(strings.Contains(app.err.(*bytes.Buffer).String(), "Retrying after transient error"), "Expected to see the retry attempt message in the logs")
 	})
 
 	t.Run("No retry on fatal error", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
 		// --- FIX 1: Set executeErr instead of the general errToReturn ---
 		mock := &mockDownloader{
 			repoInfoToReturn:    defaultRepoInfo,
@@ -228,13 +211,8 @@ func TestCLI(t *testing.T) {
 		}
 
 		err := app.run([]string{"-f", "test/repo"})
-		if err == nil {
-			t.Fatal("Expected a fatal error, but got none")
-		}
+		require.Error(err, "Expected a fatal error, but got none")
 
-		if mock.executePlanCalls != 1 {
-			t.Errorf("Expected ExecutePlan to be called only once, but was called %d times", mock.executePlanCalls)
-		}
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called only once, but was called %d times", mock.executePlanCalls)
 	})
 }
-
