@@ -110,7 +110,7 @@ func TestCLI(t *testing.T) {
 
 		// Use -f for force
 		err := app.run([]string{"-f", "test/repo"})
-		require.NoError(err, "Expected no error for forced download, got: %v", err)
+		require.NoError(err, "Expected no error for forced download")
 		// There should be no interactive prompt in the output
 		assert.False(strings.Contains(out.String(), "Proceed with download? [y/N]:"), "Expected force flag to skip the confirmation prompt")
 		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)

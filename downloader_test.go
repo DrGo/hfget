@@ -120,9 +120,9 @@ func TestFetchRepoInfo(t *testing.T) {
 
 	d := New(mockRepoID)
 	info, err := d.FetchRepoInfo(context.Background())
-	require.NoError(err)
+	require.NoError(err, "")
 
-	assert.True(info.ID == mockRepoID, fmt.Sprintf("Expected repo ID %s, got %s", mockRepoID, info.ID))
+	assert.True(info.ID == mockRepoID, "Expected repo ID %s, got %s", mockRepoID, info.ID)
 	assert.Len(info.Siblings, 2, "Expected 2 files in repo info")
 }
 
@@ -143,11 +143,11 @@ func TestBuildPlan(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir))
 
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
 		assert.Len(plan.FilesToDownload, 2, "Expected 2 files to download")
 		expectedSize := int64(len(lfsFileContent) + len(nonLFSFileContent))
-		assert.True(plan.TotalDownloadSize == expectedSize, fmt.Sprintf("Expected total size %d, got %d", expectedSize, plan.TotalDownloadSize))
+		assert.True(plan.TotalDownloadSize == expectedSize, "Expected total size %d, got %d", expectedSize, plan.TotalDownloadSize)
 	})
 
 	t.Run("Skip Existing Valid LFS File", func(t *testing.T) {
@@ -157,16 +157,16 @@ func TestBuildPlan(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir))
 
 		repoPath := d.getModelPath(mockRepoID)
-		require.NoError(os.MkdirAll(repoPath, 0755))
+		require.NoError(os.MkdirAll(repoPath, 0755), "")
 		lfsFilePath := filepath.Join(repoPath, "lfs.bin")
-		require.NoError(os.WriteFile(lfsFilePath, []byte(lfsFileContent), 0644))
+		require.NoError(os.WriteFile(lfsFilePath, []byte(lfsFileContent), 0644), "")
 
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
-		assert.Len(plan.FilesToDownload, 1, fmt.Sprintf("Expected 1 file to download, files: %v", plan.FilesToDownload))
+		assert.Len(plan.FilesToDownload, 1, "Expected 1 file to download, files: %v", plan.FilesToDownload)
 		if len(plan.FilesToDownload) == 1 {
-			assert.True(plan.FilesToDownload[0].File.Path == "regular.txt", fmt.Sprintf("Expected regular.txt to be in download plan, got %s", plan.FilesToDownload[0].File.Path))
+			assert.True(plan.FilesToDownload[0].File.Path == "regular.txt", "Expected regular.txt to be in download plan, got %s", plan.FilesToDownload[0].File.Path)
 		}
 		assert.Len(plan.FilesToSkip, 1, "Expected 1 file to be skipped")
 	})
@@ -178,12 +178,12 @@ func TestBuildPlan(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir))
 
 		repoPath := d.getModelPath(mockRepoID)
-		require.NoError(os.MkdirAll(repoPath, 0755))
+		require.NoError(os.MkdirAll(repoPath, 0755), "")
 		lfsFilePath := filepath.Join(repoPath, "lfs.bin")
-		require.NoError(os.WriteFile(lfsFilePath, []byte("invalid content"), 0644))
+		require.NoError(os.WriteFile(lfsFilePath, []byte("invalid content"), 0644), "")
 
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
 		assert.Len(plan.FilesToDownload, 2, "Expected 2 files to be in the plan for re-download")
 	})
@@ -202,12 +202,12 @@ func TestExecutePlan(t *testing.T) {
 	tmpDir := t.TempDir()
 	d := New(mockRepoID, WithDestination(tmpDir))
 	info, err := d.FetchRepoInfo(context.Background())
-	require.NoError(err)
+	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
-	require.NoError(err)
+	require.NoError(err, "")
 
 	err = d.ExecutePlan(context.Background(), plan)
-	require.NoError(err)
+	require.NoError(err, "")
 
 	repoPath := d.getModelPath(mockRepoID)
 	verifyFileContent(t, filepath.Join(repoPath, "lfs.bin"), lfsFileContent)
@@ -231,13 +231,13 @@ func TestExecutePlan_ContinueOnError(t *testing.T) {
 	tmpDir := t.TempDir()
 	d := New(mockRepoID, WithDestination(tmpDir))
 	info, err := d.FetchRepoInfo(context.Background())
-	require.NoError(err)
+	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info) // All files will be planned for download
-	require.NoError(err)
+	require.NoError(err, "")
 
 	err = d.ExecutePlan(context.Background(), plan)
 	require.Error(err, "Expected ExecutePlan to return an error for checksum mismatch, but it didn't")
-	assert.True(strings.Contains(err.Error(), "validation failed for bad.bin"), fmt.Sprintf("Expected error message to contain 'validation failed for bad.bin', but got: %v", err))
+	assert.True(strings.Contains(err.Error(), "validation failed for bad.bin"), "Expected error message to contain 'validation failed for bad.bin', but got: %v", err)
 
 	// But the good file should still have been downloaded correctly
 	repoPath := d.getModelPath(mockRepoID)
@@ -272,30 +272,30 @@ func TestFiltering(t *testing.T) {
 	t.Run("Include Pattern", func(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir), WithInclude("*.json"))
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
 		assert.Len(plan.FilesToDownload, 2, "Should only plan to download json files")
-		assert.True(findInPlan(plan.FilesToDownload, "tokenizer.json"))
-		assert.True(findInPlan(plan.FilesToDownload, "config.json"))
+		assert.True(findInPlan(plan.FilesToDownload, "tokenizer.json"), "")
+		assert.True(findInPlan(plan.FilesToDownload, "config.json"), "")
 	})
 
 	t.Run("Exclude Pattern", func(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir), WithExclude("data/*"))
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
 		assert.Len(plan.FilesToDownload, 3, "Should exclude files in the data directory")
-		assert.False(findInPlan(plan.FilesToDownload, "data/train.parquet"))
+		assert.False(findInPlan(plan.FilesToDownload, "data/train.parquet"), "")
 	})
 
 	t.Run("Include and Exclude", func(t *testing.T) {
 		d := New(mockRepoID, WithDestination(tmpDir), WithInclude("*.safetensors", "*.json"), WithExclude("config.json"))
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
-		require.NoError(err)
+		require.NoError(err, "")
 
 		assert.Len(plan.FilesToDownload, 2, "Should include safetensors and json, but exclude config.json")
-		assert.True(findInPlan(plan.FilesToDownload, "model.safetensors"))
-		assert.True(findInPlan(plan.FilesToDownload, "tokenizer.json"))
+		assert.True(findInPlan(plan.FilesToDownload, "model.safetensors"), "")
+		assert.True(findInPlan(plan.FilesToDownload, "tokenizer.json"), "")
 	})
 }
 
@@ -320,9 +320,9 @@ func TestProgressReporting_MultiThreaded(t *testing.T) {
 	// Use 5 connections to ensure multi-threading
 	d := New(mockRepoID, WithDestination(tmpDir), WithNumConnections(5), WithProgress(progressChan))
 	info, err := d.FetchRepoInfo(context.Background())
-	require.NoError(err)
+	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
-	require.NoError(err)
+	require.NoError(err, "")
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -344,7 +344,7 @@ func TestProgressReporting_MultiThreaded(t *testing.T) {
 	}()
 
 	err = d.ExecutePlan(context.Background(), plan)
-	require.NoError(err)
+	require.NoError(err, "")
 	close(progressChan)
 	wg.Wait()
 
@@ -389,7 +389,7 @@ func verifyFileContent(t *testing.T, path, expectedContent string) {
 	assert := testutils.NewAssert(t)
 
 	content, err := os.ReadFile(path)
-	require.NoError(err, fmt.Sprintf("Failed to read file %s", path))
+	require.NoError(err, "Failed to read file %s", path)
 
-	assert.True(string(content) == expectedContent, fmt.Sprintf("Content mismatch for %s. Expected '%s', got '%s'", path, expectedContent, string(content)))
+	assert.True(string(content) == expectedContent, "Content mismatch for %s. Expected '%s', got '%s'", path, expectedContent, string(content))
 }

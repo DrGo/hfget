@@ -2,7 +2,6 @@
 // It offers commonly used functions similar to testify's assert and require packages.
 package testutils
 
-
 import (
 	"fmt"
 	"reflect"
@@ -22,20 +21,28 @@ func NewAssert(t *testing.T) *Assert {
 
 // True asserts that the condition is true.
 // Logs an error using t.Errorf if the condition is false and continues execution.
-func (a *Assert) True(condition bool, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (a *Assert) True(condition bool, format string, args ...any) {
 	a.t.Helper()
 	if !condition {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		a.t.Errorf("Expected condition to be true but was false. %s", message)
 	}
 }
 
 // False asserts that the condition is false.
 // Logs an error using t.Errorf if the condition is true and continues execution.
-func (a *Assert) False(condition bool, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (a *Assert) False(condition bool, format string, args ...any) {
 	a.t.Helper()
 	if condition {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		a.t.Errorf("Expected condition to be false but was true. %s", message)
 	}
 }
@@ -43,7 +50,8 @@ func (a *Assert) False(condition bool, msgAndArgs ...any) {
 // Len asserts that the provided object has the expected length.
 // Supports arrays, slices, maps, channels, and strings.
 // Logs an error using t.Errorf if lengths do not match and continues execution.
-func (a *Assert) Len(object any, expected int, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (a *Assert) Len(object any, expected int, format string, args ...any) {
 	a.t.Helper()
 	rv := reflect.ValueOf(object)
 	sz := -1
@@ -57,27 +65,38 @@ func (a *Assert) Len(object any, expected int, msgAndArgs ...any) {
 	}
 
 	if sz != expected {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		a.t.Errorf("Expected length %d but got %d. %s", expected, sz, message)
 	}
 }
 
 // NoError asserts that err is nil.
 // Logs an error using t.Errorf if err is not nil.
-func (a *Assert) NoError(err error, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (a *Assert) NoError(err error, format string, args ...any) {
 	a.t.Helper()
 	if err != nil {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		a.t.Errorf("Expected no error but got: %v. %s", err, message)
 	}
 }
 
 // Error asserts that err is not nil.
 // Logs an error using t.Errorf if err is nil.
-func (a *Assert) Error(err error, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (a *Assert) Error(err error, format string, args ...any) {
 	a.t.Helper()
 	if err == nil {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		a.t.Errorf("Expected error but got nil. %s", message)
 	}
 }
@@ -95,27 +114,36 @@ func NewRequire(t *testing.T) *Require {
 
 // True requires that the condition is true.
 // Stops test execution using t.Fatalf if the condition is false.
-func (r *Require) True(condition bool, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (r *Require) True(condition bool, format string, args ...any) {
 	r.t.Helper()
 	if !condition {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		r.t.Fatalf("Required condition to be true but was false. %s", message)
 	}
 }
 
 // False requires that the condition is false.
 // Stops test execution using t.Fatalf if the condition is true.
-func (r *Require) False(condition bool, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (r *Require) False(condition bool, format string, args ...any) {
 	r.t.Helper()
 	if condition {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		r.t.Fatalf("Required condition to be false but was true. %s", message)
 	}
 }
 
 // Len requires that the provided object has the expected length.
 // Stops test execution using t.Fatalf if lengths do not match.
-func (r *Require) Len(object any, expected int, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (r *Require) Len(object any, expected int, format string, args ...any) {
 	r.t.Helper()
 	rv := reflect.ValueOf(object)
 	sz := -1
@@ -129,44 +157,38 @@ func (r *Require) Len(object any, expected int, msgAndArgs ...any) {
 	}
 
 	if sz != expected {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		r.t.Fatalf("Required length %d but got %d. %s", expected, sz, message)
 	}
 }
 
 // NoError requires that err is nil.
 // Stops test execution using t.Fatalf if err is not nil.
-func (r *Require) NoError(err error, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (r *Require) NoError(err error, format string, args ...any) {
 	r.t.Helper()
 	if err != nil {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		r.t.Fatalf("Expected no error but got: %v. %s", err, message)
 	}
 }
 
 // Error requires that err is not nil.
 // Stops test execution using t.Fatalf if err is nil.
-func (r *Require) Error(err error, msgAndArgs ...any) {
+// If format is provided, it will be used as a printf-style format string with the given args.
+func (r *Require) Error(err error, format string, args ...any) {
 	r.t.Helper()
 	if err == nil {
-		message := messageFrom(msgAndArgs...)
+		var message string
+		if format != "" {
+			message = fmt.Sprintf(format, args...)
+		}
 		r.t.Fatalf("Expected error but got nil. %s", message)
 	}
 }
-
-// messageFrom constructs a message string from variadic arguments.
-// If no arguments are provided, returns an empty string.
-// If the first argument is a string and there are additional args, it is treated as a format string.
-// Otherwise all args are sprinted.
-func messageFrom(msgAndArgs ...any) string {
-	if len(msgAndArgs) == 0 {
-		return ""
-	}
-	if format, ok := msgAndArgs[0].(string); ok && len(msgAndArgs) > 1 {
-		// First element is a format string with further args
-		return fmt.Sprintf(format, msgAndArgs[1:]...)
-	}
-	// Fallback to sprinting all args
-	return fmt.Sprint(msgAndArgs...)
-}
-
