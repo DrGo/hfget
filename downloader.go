@@ -1,4 +1,4 @@
-// Package hfget lightweight package for downloading models and datasets from HuggingFace 
+// Package hfget lightweight package for downloading models and datasets from HuggingFace
 package hfget
 
 import (
@@ -18,25 +18,27 @@ import (
 	"time"
 )
 
-// SafeIdleTimeoutReader wraps an io.ReadCloser and is safe for concurrent use.
+// IdleTimeoutReader wraps an io.ReadCloser and is safe for concurrent use.
 // It returns a timeout error if any single Read call takes longer than the timeout duration.
-type SafeIdleTimeoutReader struct {
+type IdleTimeoutReader struct {
+	ctx     context.Context
 	r       io.ReadCloser
 	timeout time.Duration
 }
 
-// NewSafeIdleTimeoutReader creates a new reader with a specified idle timeout.
-func NewSafeIdleTimeoutReader(r io.ReadCloser, timeout time.Duration) *SafeIdleTimeoutReader {
-	return &SafeIdleTimeoutReader{
+// NewIdleTimeoutReader creates a new reader with a specified idle timeout.
+func NewIdleTimeoutReader(ctx context.Context, r io.ReadCloser, timeout time.Duration) *IdleTimeoutReader {
+	return &IdleTimeoutReader{
+		ctx:     ctx,
 		r:       r,
 		timeout: timeout,
 	}
 }
 
 // Read implements the io.Reader interface with an idle timeout.
-func (r *SafeIdleTimeoutReader) Read(p []byte) (n int, err error) {
+func (r *IdleTimeoutReader) Read(p []byte) (n int, err error) {
 	// Create a context that will be cancelled when the timeout is reached.
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
 	defer cancel() // Ensure the context resources are always released.
 
 	type readResult struct {
@@ -52,8 +54,12 @@ func (r *SafeIdleTimeoutReader) Read(p []byte) (n int, err error) {
 	}()
 
 	select {
-	case <-ctx.Done():
-		// The context's deadline was exceeded. The most common error here is context.DeadlineExceeded.
+	case <-ctx.Done(): //deadline execeded 
+		// Force the underlying Read to abort, unblocking the goroutine.
+		r.r.Close()
+		
+		// Await goroutine exit to prevent background memory corruption on 'p'.
+		<-resultCh
 		return 0, ctx.Err()
 	case result := <-resultCh:
 		// The read operation completed successfully or with its own error.
@@ -62,7 +68,7 @@ func (r *SafeIdleTimeoutReader) Read(p []byte) (n int, err error) {
 }
 
 // Close implements the io.Closer interface.
-func (r *SafeIdleTimeoutReader) Close() error {
+func (r *IdleTimeoutReader) Close() error {
 	return r.r.Close()
 }
 
@@ -86,6 +92,11 @@ type FileSkip struct {
 	File   HFFile
 	Reason string
 }
+type progressState struct {
+	lastUpdated time.Time
+}
+
+type Option func(*Downloader)
 
 // Downloader is a client for downloading models from Hugging Face.
 type Downloader struct {
@@ -103,16 +114,10 @@ type Downloader struct {
 	includePatterns     []string
 	excludePatterns     []string
 	Progress            chan<- Progress
-	progressState map[string]*progressState // Tracks update times per file
-	progressMutex sync.Mutex                // Protects the progressState map
+	progressState       map[string]*progressState // Tracks update times per file
+	progressMutex       sync.Mutex                // Protects the progressState map
 }
 
-// Add this new struct definition as well, right after the Downloader struct.
-type progressState struct {
-	lastUpdated time.Time
-}
-
-type Option func(*Downloader)
 
 func New(repoName string, opts ...Option) *Downloader {
 	transport := &http.Transport{
@@ -235,7 +240,8 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 		return
 	}
 	// Finally, ensure the file's path is truly a child of the destination path.
-	if !strings.HasPrefix(absFullPath, absModelPath) {
+	rel, err := filepath.Rel(absModelPath, absFullPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
 		d.logger.Printf("Security check failed: file '%s' attempts to write outside of destination directory. Skipping.", file.Path)
 		return
 	}
@@ -246,7 +252,7 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 		return
 	}
 
-	isValid, reason := d.isLocalFileValid(fullPath, file)
+	isValid, reason := d.isLocalFileValid(ctx, fullPath, file)
 	if isValid {
 		d.logger.Printf("File is already present and valid, skipping: %s", file.Path)
 		plan.FilesToSkip = append(plan.FilesToSkip, FileSkip{File: file, Reason: reason})
@@ -260,7 +266,7 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 
 func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error {
 	modelPath := d.getModelPath(plan.Repo.ID)
-	if err := os.MkdirAll(modelPath, 0755); err != nil {
+	if err := os.MkdirAll(modelPath, 0o755); err != nil {
 		return fmt.Errorf("failed to create root model directory %s: %w", modelPath, err)
 	}
 
@@ -290,7 +296,7 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 			d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "On-the-fly SHA256")
 		} else {
 			fullPath := filepath.Join(modelPath, file.Path)
-			verificationMethod, err := d.verifyLocalFile(fullPath, file, true)
+			verificationMethod, err := d.verifyLocalFile(ctx, fullPath, file, true)
 			if err != nil {
 				d.logger.Printf("validation failed for %s: %v", file.Path, err)
 				downloadErrors = append(downloadErrors, fmt.Sprintf("validation failed for %s: %v", file.Path, err))
@@ -307,8 +313,18 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 
 	return nil
 }
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
 
-func (d *Downloader) verifyLocalFile(localPath string, remoteFile HFFile, disableProgress bool) (string, error) {
+func (cr *contextReader) Read(p []byte) (n int, err error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
+}
+func (d *Downloader) verifyLocalFile(ctx context.Context,localPath string, remoteFile HFFile, disableProgress bool) (string, error) {
 	d.logger.Printf("Verifying local file: %s", localPath)
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -344,7 +360,8 @@ func (d *Downloader) verifyLocalFile(localPath string, remoteFile HFFile, disabl
 			}
 			reader = progressReader
 		}
-
+// Wrap the chosen reader with context awareness
+		reader = &contextReader{ctx: ctx, r: reader}
 		hasher := sha256.New()
 		if _, err := io.Copy(hasher, reader); err != nil {
 			return "hashing error", fmt.Errorf("failed during hashing: %w", err)
@@ -359,8 +376,8 @@ func (d *Downloader) verifyLocalFile(localPath string, remoteFile HFFile, disabl
 	return "File Size", nil
 }
 
-func (d *Downloader) isLocalFileValid(localPath string, remoteFile HFFile) (bool, string) {
-	reason, err := d.verifyLocalFile(localPath, remoteFile, false)
+func (d *Downloader) isLocalFileValid(ctx context.Context, localPath string, remoteFile HFFile) (bool, string) {
+	reason, err := d.verifyLocalFile(ctx, localPath, remoteFile, false)
 	return err == nil, reason
 }
 
@@ -380,10 +397,9 @@ func (d *Downloader) shouldDownload(path string) bool {
 	}
 	return false
 }
-// Add this new function to downloader.go
 
 func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, tmpDir string, file HFFile) error {
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
@@ -421,9 +437,7 @@ func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, t
 	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections)
 }
 
-// downloadFile now returns a calculated checksum (if available) and an error.
-// Replace the existing downloadFile function with this refactored version.
-
+// downloadFile returns a calculated checksum (if available) and an error.
 func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HFFile) (string, error) {
 	downloadURL, err := d.resolveDownloadURL(ctx, file)
 	if err != nil {
@@ -432,7 +446,7 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	d.logger.Printf("Resolved download URL for '%s': %s", file.Path, downloadURL)
 
 	fullPath := filepath.Join(modelPath, file.Path)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+	if err = os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 		return "", err
 	}
 
@@ -440,15 +454,15 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 	if !file.LFS.IsLFS || file.Size < int64(d.numConnections*1024*1024) {
 		d.logger.Printf("Using single-threaded download for %s", file.Path)
 		return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
-	} 
-	
+	}
+
 	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
 	tmpDir := filepath.Join(modelPath, ".tmp")
 	err = d.downloadMultiThreaded(ctx, downloadURL, fullPath, tmpDir, file)
 	// Return empty checksum, signaling that post-download verification is needed.
 	return "", err
 }
-// Add progressCounter *atomic.Int64 to the function signature
+
 func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile, progressCounter *atomic.Int64) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -473,7 +487,7 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 	}
 	defer out.Close()
 
-	idleReader := NewSafeIdleTimeoutReader(resp.Body, 60*time.Second)
+	idleReader := NewIdleTimeoutReader(ctx, resp.Body, 60*time.Second)
 	progressWriter := &progressWriter{
 		filepath:     file.Path,
 		totalSize:    file.Size,
@@ -485,6 +499,7 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
+
 // downloadSingleThreaded now returns the calculated SHA256 checksum as a hex string.
 func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath string, file HFFile) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -510,7 +525,7 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	defer out.Close()
 
 	var downloadedBytes atomic.Int64
-	idleReader := NewSafeIdleTimeoutReader(resp.Body, 60*time.Second)
+	idleReader := NewIdleTimeoutReader(ctx, resp.Body, 60*time.Second)
 
 	// Create a new hasher
 	hasher := sha256.New()
@@ -533,6 +548,7 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 	return actualChecksum, nil
 }
+
 func (d *Downloader) sendProgress(filepath string, state ProgressState, current, total int64, msg string) {
 	if d.Progress == nil {
 		return
@@ -552,7 +568,6 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 	fileState := d.progressState[filepath]
 
 	isFinalState := (state == ProgressStateComplete || state == ProgressStateVerified)
-	// --- NEW LOGIC HERE ---
 	// Also consider a download 100% complete as a final, non-throttled state.
 	isDownloadComplete := (state == ProgressStateDownloading && current == total)
 
@@ -566,7 +581,6 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 	// If we are sending, update the timestamp.
 	fileState.lastUpdated = time.Now()
 	d.progressMutex.Unlock()
-
 
 	progressUpdate := Progress{
 		Filepath:    filepath,
@@ -584,6 +598,7 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 		// The channel was blocked. Drop the update to prevent hanging.
 	}
 }
+
 func mergeFiles(outputFileName, tempDir, baseName string, numChunks int) error {
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {

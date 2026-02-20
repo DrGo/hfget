@@ -522,13 +522,16 @@ func isTransientError(err error) bool {
 	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) {
 		return false
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
-	}
-	if strings.Contains(err.Error(), "i/o timeout") {
+	
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() 
+	}
+
 	return false
 }
 

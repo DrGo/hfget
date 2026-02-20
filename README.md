@@ -5,6 +5,43 @@ datasets from HuggingFace. It is designed to be fast, reliable, and
 script-friendly, with features like concurrent downloads, file integrity 
 verification, and advanced filtering.
 
+```bash
+$ hfget lmstudio-community/Qwen3-Coder-Next-MLX-6bit
+Fetching repository information...
+Analysis complete.
+----------------------------------------------------
+Repository:    lmstudio-community/Qwen3-Coder-Next-MLX-6bit
+Last Modified: Mon, 02 Feb 2026 23:52:11 UTC
+----------------------------------------------------
+Files to download (Reason: missing):
+  - .gitattributes                                               (1.5 KB)
+  - README.md                                                    (2.1 KB)
+  - chat_template.jinja                                          (5.9 KB)
+  - config.json                                                  (21.7 KB)
+  - generation_config.json                                       (214 B)
+  - model-00001-of-00013.safetensors                             (4.8 GB)
+  - model-00002-of-00013.safetensors                             (5.0 GB)
+  - model-00003-of-00013.safetensors                             (5.0 GB)
+  - model-00004-of-00013.safetensors                             (5.0 GB)
+  - model-00005-of-00013.safetensors                             (5.0 GB)
+  - model-00006-of-00013.safetensors                             (5.0 GB)
+  - model-00007-of-00013.safetensors                             (5.0 GB)
+  - model-00008-of-00013.safetensors                             (5.0 GB)
+  - model-00009-of-00013.safetensors                             (5.0 GB)
+  - model-00010-of-00013.safetensors                             (5.0 GB)
+  - model-00011-of-00013.safetensors                             (5.0 GB)
+  - model-00012-of-00013.safetensors                             (5.0 GB)
+  - model-00013-of-00013.safetensors                             (659.6 MB)
+  - model.safetensors.index.json                                 (169.4 KB)
+  - tokenizer.json                                               (10.9 MB)
+  - tokenizer_config.json                                        (6.8 KB)
+----------------------------------------------------
+Total download size: 60.3 GB
+Proceed with download? [y/N]: y
+Starting download...
+Overall: 100.0% (60.3 GB/60.3 GB) | Complete.
+```
+
 ## Features
 
 * **Concurrent Downloads:** Utilizes multiple connections to download large 
