@@ -1,3 +1,4 @@
+// Package hfget lightweight package for downloading models and datasets from HuggingFace 
 package hfget
 
 import (

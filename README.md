@@ -1,7 +1,7 @@
 # hfget - A Robust Hugging Face Downloader
 
 `hfget` is a lightweight, command-line utility for downloading models and 
-datasets from Hugging Face. It is designed to be fast, reliable, and 
+datasets from HuggingFace. It is designed to be fast, reliable, and 
 script-friendly, with features like concurrent downloads, file integrity 
 verification, and advanced filtering.
 
