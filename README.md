@@ -156,76 +156,24 @@ hfget -f imdatta0/nanollama
 
 Flags can also be set via environment variables (e.g., setting `HFGET_TOKEN` 
 instead of using the `-t` flag).
+| Flag | Shorthand | Environment Variable | Description | Default |
+| :--- | :--- | :--- | :--- | :--- |
+| `--dataset` | | | Specify that the repository is a dataset. | `false` |
+| `--branch` | `-b` | `HFGET_BRANCH` | The repository branch to download from. | `"main"` |
+| `--dest` | `-d` | `HFGET_DEST` | The local directory where files will be saved. | `"./"` |
+| | `-c` | `HFGET_CONCURRENT_CONNECTIONS` | Number of concurrent connections for downloading. | `5` |
+| `--token` | `-t` | `HFGET_TOKEN` | Your Hugging Face auth token. | `""` |
+| `--skip-checksum`| | `HFGET_SKIP_CHECKSUM` | Skip SHA256 checksum verification. | `false` |
+| `--tree` | | | Use nested tree structure for output directory. | `false` |
+| `--include` | | | Comma-separated glob patterns for files to include. | `""` |
+| `--exclude` | | | Comma-separated glob patterns for files to exclude. | `""` |
+| `--max-retries` | | | Maximum retries on transient network errors. | `3` |
+| `--retry-interval` | | | The time to wait between retries. | `5s` |
+| `--quiet` | `-q` | | Suppress interactive progress and prompts. | `false` |
+| `--force` | `-f` | | Force re-download of all files (implies `--quiet`). | `false` |
+| `--verbose` | `-v` | | Enable verbose diagnostic logging to stderr. | `false` |
+| `--version` | | | Show version information and exit. | `false` |
 
-| Flag             | Shorthand | Environment Variable           | Description   
-                                              | Default |
-| :--------------- | :-------- | :----------------------------- | 
-:---------------------------------------------------------- | :------ |
-| `--dataset`      |           |                                | Specify that 
-the repository is a dataset.                   | `false` |
-| `--branch`       | `-b`      | `HFGET_BRANCH`                 | The 
-repository branch to download from.                     | `"main"`  |
-| `--dest`         | `-d`      | `HFGET_DEST`                   | The local 
-directory where files will be saved.              | `"./"`    |
-|                  | `-c`      | `HFGET_CONCURRENT_CONNECTIONS` | Number of 
-concurrent connections for downloading.           | `5`       |
-| `--token`        | `-t`      | `HFGET_TOKEN`                  | Your Hugging 
-Face auth token.                               | `""`      |
-| `--skip-checksum`|           | `HFGET_SKIP_CHECKSUM`          | Skip SHA256 
-checksum verification.                          | `false`   |
-| `--tree`         |           |                                | Use nested 
-tree structure for output directory.             | `false`   |
-| `--include`      |           |                                | 
-Comma-separated glob patterns for files to include.         | `""`      |
-| `--exclude`      |           |                                | 
-Comma-separated glob patterns for files to exclude.         | `""`      |
-| `--max-retries`  |           |                                | Maximum 
-retries on transient network errors.                | `3`       |
-| `--retry-interval` |         |                                | The time to 
-wait between retries.                           | `5s`      |
-| `--quiet`        | `-q`      |                                | Suppress 
-interactive progress and prompts.                  | `false`   |
-| `--force`        | `-f`      |                                | Force 
-re-download of all files (implies `--quiet`).         | `false`   |
-| `--verbose`      | `-v`      |                                | Enable 
-verbose diagnostic logging to stderr.                | `false`   |
-| `--version`      |           |                                | Show version 
-information and exit.                          | `false`   |
-
-## Technical Implementation Details
-
-`hfget` operates in distinct phases to ensure efficiency and correctness.
-
-#### 1. Fetching Phase
-First, the application makes API calls to Hugging Face to get a complete, 
-**flat list** of all files in the target repository. This provides a full 
-manifest of the remote state.
-
-#### 2. Analysis & Planning Phase
-With the full remote file list, `hfget` builds a "download plan":
-1.  **Progress Display:** An "Analyzing (xx.x%)" progress bar appears, showing 
-the overall progress of the local file check. The percentage is accurately 
-calculated based on the total size of all files to be verified.
-2.  **Local File Check:** For each file in the remote manifest, it checks the 
-local disk to see if a corresponding file already exists.
-3.  **Verification:** If a file exists, it's verified against its expected size 
-and (for LFS files) its SHA256 checksum. The progress bar updates as this 
-happens.
-4.  **Plan Creation:** Based on the verification results, a plan is created 
-detailing which files to skip and which to download.
-
-#### 3. Execution Phase
-Once the plan is built and (if in interactive mode) confirmed by the user, the 
-application executes it:
-1.  **Concurrent Downloads:** For large files, the download is split into 
-multiple chunks that are fetched simultaneously. An idle timeout ensures the 
-download doesn't freeze on a stalled connection.
-2.  **File Assembly:** Once all chunks for a file are downloaded, they are 
-assembled into a single file on disk.
-3.  **Continue on Failure:** If a file fails to download or pass verification, 
-the error is logged, and the application continues to the next file, ensuring 
-one bad file doesn't stop the entire job. A summary of any failures is 
-presented at the end.
 
 ## License
 
