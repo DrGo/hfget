@@ -17,7 +17,7 @@ builds:
     # ldflags are used to inject variables at compile time.
     # Here we inject the version, commit, and date from the git tag.
     ldflags:
-      - -s -w -X main.VERSION={{.Version}}
+      - -s -w -X main.VERSION={{.Tag}}
     # A list of OS/Architecture combinations to build for.
     # This list covers the most common platforms.
     goos:

@@ -1,6 +1,5 @@
 # The single source of truth for the version number, read from the VERSION file.
-VERSION := $(shell sed 's/ / /g' VERSION)
-
+VERSION := $(shell cat VERSION | tr -d '[:space:]')
 # Variables for local builds and installation.
 BINARY_NAME=hfget
 CMD_PATH=./cmd
@@ -36,7 +35,7 @@ install:
 tag:
 	@echo "--- Tagging release for version $(VERSION)..."
 	@git add VERSION
-	@git commit -m "chore: bump version to $(VERSION)"
+	@git commit VERSION -m "chore: bump version to $(VERSION)"
 	@git tag -a $(VERSION) -m "Release $(VERSION)"
 	@echo "--- Pushing commit and tag to origin..."
 	@git push origin main
