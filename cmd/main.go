@@ -192,11 +192,9 @@ func (app *cliApp) run(args []string) error {
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
 		downloader = app.newDownloader(repoName, optsWithProgress...)
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize)
-		}()
+		})
 	}
 
 	plan, err := downloader.BuildPlan(context.Background(), repoInfo)
@@ -274,11 +272,9 @@ func (app *cliApp) run(args []string) error {
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
 		downloader = app.newDownloader(repoName, optsWithProgress...)
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			downloadDisplayProgress(app.err, progressChan, app.terminalFd, plan)
-		}()
+		})
 	}
 
 	log.Println("Starting download...")
@@ -521,14 +517,14 @@ func isTransientError(err error) bool {
 	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) {
 		return false
 	}
-	
+
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
 
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Timeout() 
+		return netErr.Timeout()
 	}
 
 	return false
@@ -560,4 +556,3 @@ func truncateString(s string, maxLen int) string {
 	}
 	return "..." + s[len(s)-maxLen+3:]
 }
-
