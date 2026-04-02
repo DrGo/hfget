@@ -2,7 +2,7 @@ package hfget
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-// Custom error types for specific, non-transient HTTP errors.
 var (
 	ErrAuthentication = errors.New("authentication failed (401): check your token")
 	ErrForbidden      = errors.New("forbidden (403): you may need to accept the repository's terms on the Hugging Face website")
@@ -117,7 +116,7 @@ func (d *Downloader) fetchRepoInfo(ctx context.Context) (*RepoInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	if err := handleAPIError(resp, apiURL); err != nil {
+	if err = handleAPIError(resp, apiURL); err != nil {
 		return nil, err
 	}
 
@@ -127,7 +126,7 @@ func (d *Downloader) fetchRepoInfo(ctx context.Context) (*RepoInfo, error) {
 	}
 
 	var info RepoInfo
-	if err := json.Unmarshal(body, &info); err != nil {
+	if err = json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal repo info from %s: %w", apiURL, err)
 	}
 	
@@ -156,7 +155,7 @@ func (d *Downloader) fetchTree(ctx context.Context, folderPath string) ([]HFFile
 	}
 	defer resp.Body.Close()
 
-	if err := handleAPIError(resp, apiURL); err != nil {
+	if err = handleAPIError(resp, apiURL); err != nil {
 		return nil, err
 	}
 
@@ -203,7 +202,6 @@ func (d *Downloader) resolveDownloadURL(ctx context.Context, file HFFile) (strin
 	return resolverURL, nil
 }
 
-// --- ADDED BACK MISSING FUNCTION ---
 // handleAPIError checks the HTTP response for common errors and returns a typed error.
 func handleAPIError(resp *http.Response, url string) error {
 	switch resp.StatusCode {

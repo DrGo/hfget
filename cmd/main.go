@@ -76,7 +76,6 @@ func (app *cliApp) run(args []string) error {
 	log.SetOutput(app.err)
 	log.SetFlags(0)
 
-	// --- FIX: Create a single reader to be used for all prompts ---
 	stdinReader := bufio.NewReader(os.Stdin)
 
 	var (
