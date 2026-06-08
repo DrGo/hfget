@@ -4,18 +4,20 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	hfg "github.com/drgo/hfget"
+	flag "github.com/spf13/pflag"
 	"golang.org/x/term"
 )
 
@@ -40,14 +42,17 @@ type realDownloader struct {
 func (r *realDownloader) FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, error) {
 	return r.Downloader.FetchRepoInfo(ctx)
 }
+
 func (r *realDownloader) BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) (*hfg.DownloadPlan, error) {
 	return r.Downloader.BuildPlan(ctx, repoInfo)
 }
+
 func (r *realDownloader) ExecutePlan(ctx context.Context, plan *hfg.DownloadPlan) error {
 	return r.Downloader.ExecutePlan(ctx, plan)
 }
 
 type cliApp struct {
+	in            io.Reader
 	out           io.Writer
 	err           io.Writer
 	isTerminal    bool
@@ -58,6 +63,7 @@ type cliApp struct {
 func main() {
 	fd := int(os.Stderr.Fd())
 	app := &cliApp{
+		in:         os.Stdin,
 		out:        os.Stdout,
 		err:        os.Stderr,
 		isTerminal: term.IsTerminal(fd),
@@ -169,11 +175,12 @@ func (app *cliApp) run(args []string) error {
 	if verbose {
 		opts = append(opts, hfg.WithVerboseOutput(app.err))
 	}
-
-	downloader := app.newDownloader(repoName, opts...)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	downer := app.newDownloader(repoName, opts...)
 
 	fmt.Fprintln(app.err, "Fetching repository information...")
-	repoInfo, err := downloader.FetchRepoInfo(context.Background())
+	repoInfo, err := downer.FetchRepoInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("could not fetch repository info: %w", err)
 	}
@@ -190,14 +197,14 @@ func (app *cliApp) run(args []string) error {
 	if !quiet {
 		progressChan = make(chan hfg.Progress, numConnections*2)
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
-		downloader = app.newDownloader(repoName, optsWithProgress...)
+		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
 			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize)
 		})
 	}
 
-	plan, err := downloader.BuildPlan(context.Background(), repoInfo)
+	plan, err := downer.BuildPlan(context.Background(), repoInfo)
 	if !quiet {
 		close(progressChan)
 		wg.Wait()
@@ -270,7 +277,7 @@ func (app *cliApp) run(args []string) error {
 	if !quiet {
 		progressChan = make(chan hfg.Progress, numConnections*2)
 		optsWithProgress := append(opts, hfg.WithProgressChannel(progressChan))
-		downloader = app.newDownloader(repoName, optsWithProgress...)
+		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
 			downloadDisplayProgress(app.err, progressChan, app.terminalFd, plan)
@@ -284,7 +291,7 @@ func (app *cliApp) run(args []string) error {
 			log.Printf("Retrying after transient error (attempt %d/%d)...", i+1, maxRetries)
 			time.Sleep(retryInterval)
 		}
-		lastErr = downloader.ExecutePlan(context.Background(), plan)
+		lastErr = downer.ExecutePlan(context.Background(), plan)
 		if lastErr == nil || !isTransientError(lastErr) {
 			break
 		}
@@ -551,8 +558,9 @@ func formatSpeed(s float64) string {
 }
 
 func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	rs := []rune(s)
+	if len(rs) <= maxLen {
 		return s
 	}
-	return "..." + s[len(s)-maxLen+3:]
+	return "..." + string(rs[len(rs)-maxLen+3:])
 }
