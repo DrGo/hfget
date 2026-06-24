@@ -15,8 +15,6 @@ var (
 	ErrAuthentication = errors.New("authentication failed (401): check your token")
 	ErrForbidden      = errors.New("forbidden (403): you may need to accept the repository's terms on the Hugging Face website")
 	ErrNotFound       = errors.New("not found (404): check the repository name and branch")
-
-	baseURL                = "https://huggingface.co"
 )
 
 const (
@@ -100,7 +98,7 @@ func (d *Downloader) fetchRepoInfo(ctx context.Context) (*RepoInfo, error) {
 	} else {
 		urlFormat = jsonModelsInfoURL
 	}
-	apiURL := baseURL + fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch))
+	apiURL := d.baseURL + fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -129,7 +127,7 @@ func (d *Downloader) fetchRepoInfo(ctx context.Context) (*RepoInfo, error) {
 	if err = json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal repo info from %s: %w", apiURL, err)
 	}
-	
+
 	rootTree, err := d.fetchTree(ctx, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch root tree to complement repo info: %w", err)
@@ -218,7 +216,6 @@ func handleAPIError(resp *http.Response, url string) error {
 	}
 }
 
-
 func (d *Downloader) buildTreeURL(folderPath string) string {
 	var urlFormat string
 	if d.isDataset {
@@ -226,12 +223,17 @@ func (d *Downloader) buildTreeURL(folderPath string) string {
 	} else {
 		urlFormat = jsonModelsFileTreeURL
 	}
+
+	// FIX: Use d.baseURL instead of the global baseURL
 	baseAPIPath := fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch))
-	fullURL := baseURL + baseAPIPath
+	fullURL := d.baseURL + baseAPIPath
+
 	if folderPath != "" {
 		fullURL = fullURL + "/" + url.PathEscape(folderPath)
 	}
-	return fullURL
+
+	// FIX: Append recursive=true to fetch all subdirectories in a single flat list
+	return fullURL + "?recursive=true"
 }
 
 func (d *Downloader) buildResolverURL(filePath string, isLFS bool) string {
@@ -249,5 +251,5 @@ func (d *Downloader) buildResolverURL(filePath string, isLFS bool) string {
 			urlFormat = rawModelFileURL
 		}
 	}
-	return baseURL + fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch), filePath)
+	return d.baseURL + fmt.Sprintf(urlFormat, d.repoName, url.QueryEscape(d.branch), filePath)
 }

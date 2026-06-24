@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -54,10 +55,10 @@ func (r *IdleTimeoutReader) Read(p []byte) (n int, err error) {
 	}()
 
 	select {
-	case <-ctx.Done(): //deadline execeded 
+	case <-ctx.Done(): // deadline execeded
 		// Force the underlying Read to abort, unblocking the goroutine.
 		r.r.Close()
-		
+
 		// Await goroutine exit to prevent background memory corruption on 'p'.
 		<-resultCh
 		return 0, ctx.Err()
@@ -68,9 +69,7 @@ func (r *IdleTimeoutReader) Read(p []byte) (n int, err error) {
 }
 
 // Close implements the io.Closer interface.
-func (r *IdleTimeoutReader) Close() error {
-	return r.r.Close()
-}
+func (r *IdleTimeoutReader) Close() error { return r.r.Close() }
 
 // DownloadPlan holds a detailed summary of actions to be taken.
 type DownloadPlan struct {
@@ -92,9 +91,6 @@ type FileSkip struct {
 	File   HFFile
 	Reason string
 }
-type progressState struct {
-	lastUpdated time.Time
-}
 
 type Option func(*Downloader)
 
@@ -102,6 +98,7 @@ type Option func(*Downloader)
 type Downloader struct {
 	client              *http.Client
 	logger              *log.Logger
+	baseURL             string
 	numConnections      int
 	authToken           string
 	skipSHA             bool
@@ -114,10 +111,7 @@ type Downloader struct {
 	includePatterns     []string
 	excludePatterns     []string
 	Progress            chan<- Progress
-	progressState       map[string]*progressState // Tracks update times per file
-	progressMutex       sync.Mutex                // Protects the progressState map
 }
-
 
 func New(repoName string, opts ...Option) *Downloader {
 	transport := &http.Transport{
@@ -134,6 +128,7 @@ func New(repoName string, opts ...Option) *Downloader {
 	}
 
 	d := &Downloader{
+		baseURL:             "https://huggingface.co",
 		repoName:            repoName,
 		numConnections:      5,
 		branch:              "main",
@@ -265,21 +260,25 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 }
 
 func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error {
-	modelPath := d.getModelPath(plan.Repo.ID)
-	if err := os.MkdirAll(modelPath, 0o755); err != nil {
-		return fmt.Errorf("failed to create root model directory %s: %w", modelPath, err)
+	if err := d.prepareOutputDirectory(plan.Repo.ID); err != nil {
+		return err
 	}
-
-	var downloadErrors []string
-
+	modelPath := d.getModelPath(plan.Repo.ID)
+	var downloadErrors []error
 	for _, fileToDownload := range plan.FilesToDownload {
+		// Check for context cancellation before starting each file
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("download plan cancelled: %w", err)
+		}
+
 		file := fileToDownload.File
 		d.logger.Printf("Starting download of: %s", file.Path)
 
-		calculatedChecksum, err := d.downloadFile(ctx, modelPath, file)
+		calculatedChecksum, err := d.downloadFile(ctx, d.getModelPath(plan.Repo.ID), file)
 		if err != nil {
 			d.logger.Printf("failed to download %s: %v", file.Path, err)
-			downloadErrors = append(downloadErrors, fmt.Sprintf("failed to download %s: %v", file.Path, err))
+			// FIX: Wrap the error to preserve the chain (e.g., context.DeadlineExceeded)
+			downloadErrors = append(downloadErrors, fmt.Errorf("failed to download %s: %w", file.Path, err))
 			continue
 		}
 
@@ -287,19 +286,29 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 
 		if calculatedChecksum != "" {
 			if !d.skipSHA && file.LFS.IsLFS && calculatedChecksum != file.LFS.Oid {
-				errStr := fmt.Sprintf("validation failed for %s: checksum mismatch: expected %s, got %s", file.Path, file.LFS.Oid, calculatedChecksum)
+				errStr := fmt.Errorf("validation failed for %s: checksum mismatch: expected %s, got %s", file.Path, file.LFS.Oid, calculatedChecksum)
 				d.logger.Print(errStr)
 				downloadErrors = append(downloadErrors, errStr)
+
+				// FIX: Clean up the corrupted file to prevent it from being mistakenly used
+				fullPath := filepath.Join(modelPath, file.Path)
+				if removeErr := os.Remove(fullPath); removeErr != nil && !os.IsNotExist(removeErr) {
+					d.logger.Printf("failed to remove corrupted file %s: %v", fullPath, removeErr)
+				}
 				continue
 			}
 			d.logger.Printf("Successfully verified '%s' via on-the-fly SHA256", file.Path)
 			d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, "On-the-fly SHA256")
 		} else {
-			fullPath := filepath.Join(modelPath, file.Path)
+			fullPath := filepath.Join(d.getModelPath(plan.Repo.ID), file.Path)
 			verificationMethod, err := d.verifyLocalFile(ctx, fullPath, file, true)
 			if err != nil {
 				d.logger.Printf("validation failed for %s: %v", file.Path, err)
-				downloadErrors = append(downloadErrors, fmt.Sprintf("validation failed for %s: %v", file.Path, err))
+				downloadErrors = append(downloadErrors, fmt.Errorf("validation failed for %s: %w", file.Path, err))
+				// FIX: Clean up the corrupted file
+				if removeErr := os.Remove(fullPath); removeErr != nil && !os.IsNotExist(removeErr) {
+					d.logger.Printf("failed to remove corrupted file %s: %v", fullPath, removeErr)
+				}
 				continue
 			}
 			d.logger.Printf("Successfully verified '%s' via %s", verificationMethod, file.Path)
@@ -307,12 +316,29 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 		}
 	}
 
-	if len(downloadErrors) > 0 {
-		return fmt.Errorf("%d file(s) failed to download or verify:\n- %s", len(downloadErrors), strings.Join(downloadErrors, "\n- "))
-	}
+	return aggregateErrors(downloadErrors)
+}
 
+// prepareOutputDirectory ensures the root model directory exists.
+func (d *Downloader) prepareOutputDirectory(repoID string) error {
+	modelPath := d.getModelPath(repoID)
+	if err := os.MkdirAll(modelPath, 0o755); err != nil {
+		return fmt.Errorf("failed to create root model directory %s: %w", modelPath, err)
+	}
 	return nil
 }
+
+// aggregateErrors joins multiple download errors into a single error.
+// Crucially, it uses errors.Join to preserve the error chain, allowing
+// callers (like the CLI retry loop) to use errors.Is/As on the underlying errors.
+func aggregateErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	joinedErr := errors.Join(errs...)
+	return fmt.Errorf("%d file(s) failed to download or verify: %w", len(errs), joinedErr)
+}
+
 type contextReader struct {
 	ctx context.Context
 	r   io.Reader
@@ -324,7 +350,8 @@ func (cr *contextReader) Read(p []byte) (n int, err error) {
 	}
 	return cr.r.Read(p)
 }
-func (d *Downloader) verifyLocalFile(ctx context.Context,localPath string, remoteFile HFFile, disableProgress bool) (string, error) {
+
+func (d *Downloader) verifyLocalFile(ctx context.Context, localPath string, remoteFile HFFile, disableProgress bool) (string, error) {
 	d.logger.Printf("Verifying local file: %s", localPath)
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -360,7 +387,7 @@ func (d *Downloader) verifyLocalFile(ctx context.Context,localPath string, remot
 			}
 			reader = progressReader
 		}
-// Wrap the chosen reader with context awareness
+		// Wrap the chosen reader with context awareness
 		reader = &contextReader{ctx: ctx, r: reader}
 		hasher := sha256.New()
 		if _, err := io.Copy(hasher, reader); err != nil {
@@ -398,9 +425,9 @@ func (d *Downloader) shouldDownload(path string) bool {
 	return false
 }
 
-func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, tmpDir string, file HFFile) error {
+func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, tmpDir string, file HFFile) (string, error) {
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -410,6 +437,11 @@ func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, t
 	errChan := make(chan error, d.numConnections)
 
 	for i := range d.numConnections {
+		// FIX: Check context before spawning each chunk goroutine
+		if err := ctx.Err(); err != nil {
+			// Cancel remaining chunks by closing a local context or just returning
+			return "", fmt.Errorf("multi-threaded download cancelled: %w", err)
+		}
 		start := int64(i) * chunkSize
 		end := start + chunkSize - 1
 		if i == d.numConnections-1 {
@@ -429,12 +461,12 @@ func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, t
 
 	for err := range errChan {
 		if err != nil {
-			return err // Return on first chunk error
+			return "", err // Return on first chunk error
 		}
 	}
 
 	d.logger.Printf("All chunks downloaded for %s, merging files...", file.Path)
-	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections)
+	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections, file, d.skipSHA)
 }
 
 // downloadFile returns a calculated checksum (if available) and an error.
@@ -458,9 +490,9 @@ func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HF
 
 	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
 	tmpDir := filepath.Join(modelPath, ".tmp")
-	err = d.downloadMultiThreaded(ctx, downloadURL, fullPath, tmpDir, file)
-	// Return empty checksum, signaling that post-download verification is needed.
-	return "", err
+	checksum, err := d.downloadMultiThreaded(ctx, downloadURL, fullPath, tmpDir, file)
+	// Return the checksum calculated during the merge phase
+	return checksum, err
 }
 
 func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile, progressCounter *atomic.Int64) error {
@@ -518,11 +550,11 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
-	out, err := os.Create(fullPath)
+	tmpPath := fullPath + ".tmp"
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
 
 	var downloadedBytes atomic.Int64
 	idleReader := NewIdleTimeoutReader(ctx, resp.Body, 60*time.Second)
@@ -541,46 +573,26 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	}
 
 	if _, err = io.Copy(progressWriter, idleReader); err != nil {
+		out.Close()
+		os.Remove(tmpPath)
 		return "", err
 	}
-
+	out.Close()
 	// Calculate the final checksum and return it.
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
+	// Atomic rename
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to rename downloaded file: %w", err)
+	}
 	return actualChecksum, nil
 }
 
+// REPLACE the entire sendProgress function with this lock-free version:
 func (d *Downloader) sendProgress(filepath string, state ProgressState, current, total int64, msg string) {
 	if d.Progress == nil {
 		return
 	}
-
-	throttleInterval := 100 * time.Millisecond
-
-	d.progressMutex.Lock()
-	// Initialize the map on first use.
-	if d.progressState == nil {
-		d.progressState = make(map[string]*progressState)
-	}
-	// Get or create a state tracker for this specific file.
-	if _, ok := d.progressState[filepath]; !ok {
-		d.progressState[filepath] = &progressState{}
-	}
-	fileState := d.progressState[filepath]
-
-	isFinalState := (state == ProgressStateComplete || state == ProgressStateVerified)
-	// Also consider a download 100% complete as a final, non-throttled state.
-	isDownloadComplete := (state == ProgressStateDownloading && current == total)
-
-	// Throttle the update if it's not a final state, not a 100% download update,
-	// not the first update, AND not enough time has passed.
-	if !isFinalState && !isDownloadComplete && !fileState.lastUpdated.IsZero() && time.Since(fileState.lastUpdated) < throttleInterval {
-		d.progressMutex.Unlock()
-		return // Skip sending this update.
-	}
-
-	// If we are sending, update the timestamp.
-	fileState.lastUpdated = time.Now()
-	d.progressMutex.Unlock()
 
 	progressUpdate := Progress{
 		Filepath:    filepath,
@@ -590,35 +602,65 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 		Message:     msg,
 	}
 
-	// Use the non-blocking send.
+	// Non-blocking send. If the consumer (UI) is busy and the channel buffer is full,
+	// we simply drop the update. The next update will catch up.
+	// The consumer's 500ms ticker naturally handles UI throttling.
 	select {
 	case d.Progress <- progressUpdate:
-		// The update was sent successfully.
 	default:
-		// The channel was blocked. Drop the update to prevent hanging.
 	}
 }
 
-func mergeFiles(outputFileName, tempDir, baseName string, numChunks int) error {
-	outputFile, err := os.Create(outputFileName)
+func mergeFiles(outputFileName, tempDir, baseName string, numChunks int, file HFFile, skipSHA bool) (string, error) {
+	tmpOutName := outputFileName + ".merge-tmp"
+	outputFile, err := os.Create(tmpOutName)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("failed to create merge temp file: %w", err)
 	}
-	defer outputFile.Close()
+
+	// Create hasher and MultiWriter to calculate SHA256 on-the-fly
+	hasher := sha256.New()
+	writer := io.MultiWriter(outputFile, hasher)
+
 	for i := range numChunks {
 		tmpFileName := filepath.Join(tempDir, fmt.Sprintf("%s_%d.tmp", baseName, i))
 		tmpFile, err := os.Open(tmpFileName)
 		if err != nil {
-			return err
+			outputFile.Close()
+			os.Remove(tmpOutName)
+			return "", fmt.Errorf("failed to open chunk %d: %w", i, err)
 		}
-		if _, err := io.Copy(outputFile, tmpFile); err != nil {
+
+		if _, err := io.Copy(writer, tmpFile); err != nil {
 			tmpFile.Close()
-			return err
+			outputFile.Close()
+			os.Remove(tmpOutName)
+			return "", fmt.Errorf("failed to copy chunk %d: %w", i, err)
 		}
 		tmpFile.Close()
+
+		// Clean up the chunk file immediately after copying
 		_ = os.Remove(tmpFileName)
 	}
-	return nil
+
+	// CRITICAL: Close the file handle before renaming to prevent Windows file-lock errors
+	outputFile.Close()
+
+	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+	// Verify checksum before committing the file
+	if file.LFS.IsLFS && !skipSHA && actualChecksum != file.LFS.Oid {
+		os.Remove(tmpOutName)
+		return "", fmt.Errorf("checksum mismatch during merge: expected %s, got %s", file.LFS.Oid, actualChecksum)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpOutName, outputFileName); err != nil {
+		os.Remove(tmpOutName)
+		return "", fmt.Errorf("failed to rename merged file: %w", err)
+	}
+
+	return actualChecksum, nil
 }
 
 func formatBytes(b int64) string {

@@ -2,6 +2,8 @@ package hfget
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	 "github.com/drgo/hfget/testutils"
+	"github.com/drgo/hfget/testutils"
 )
 
 const (
@@ -116,9 +118,7 @@ func TestFetchRepoInfo(t *testing.T) {
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-	baseURL = server.URL
-
-	d := New(mockRepoID)
+d := New(mockRepoID, WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 
@@ -197,10 +197,8 @@ func TestExecutePlan(t *testing.T) {
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-	baseURL = server.URL
-
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir))
+	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
@@ -226,10 +224,9 @@ func TestExecutePlan_ContinueOnError(t *testing.T) {
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-	baseURL = server.URL
 
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir))
+	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info) // All files will be planned for download
@@ -270,7 +267,8 @@ func TestFiltering(t *testing.T) {
 	}
 
 	t.Run("Include Pattern", func(t *testing.T) {
-		d := New(mockRepoID, WithDestination(tmpDir), WithInclude("*.json"))
+		d := New(mockRepoID, WithDestination(tmpDir), WithIncludePatterns([]string{"*.json"}))
+
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
 		require.NoError(err, "")
 
@@ -280,7 +278,7 @@ func TestFiltering(t *testing.T) {
 	})
 
 	t.Run("Exclude Pattern", func(t *testing.T) {
-		d := New(mockRepoID, WithDestination(tmpDir), WithExclude("data/*"))
+		d := New(mockRepoID, WithDestination(tmpDir), WithExcludePatterns([]string{"data/*"}))
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
 		require.NoError(err, "")
 
@@ -289,7 +287,7 @@ func TestFiltering(t *testing.T) {
 	})
 
 	t.Run("Include and Exclude", func(t *testing.T) {
-		d := New(mockRepoID, WithDestination(tmpDir), WithInclude("*.safetensors", "*.json"), WithExclude("config.json"))
+		d := New(mockRepoID, WithDestination(tmpDir), WithIncludePatterns([]string{"*.safetensors", "*.json"}), WithExcludePatterns([]string{"config.json"}))
 		plan, err := d.BuildPlan(context.Background(), repoInfo)
 		require.NoError(err, "")
 
@@ -312,13 +310,12 @@ func TestProgressReporting_MultiThreaded(t *testing.T) {
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-	baseURL = server.URL
 
 	tmpDir := t.TempDir()
 	progressChan := make(chan Progress, 100) // Buffered channel
 
 	// Use 5 connections to ensure multi-threading
-	d := New(mockRepoID, WithDestination(tmpDir), WithNumConnections(5), WithProgress(progressChan))
+	d := New(mockRepoID, WithDestination(tmpDir), WithConnections(5), WithProgressChannel(progressChan))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
@@ -360,10 +357,9 @@ func TestTimeoutHandling(t *testing.T) {
 		time.Sleep(5 * time.Second) // Hang longer than the timeout
 	}))
 	defer server.Close()
-	baseURL = server.URL
 
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir))
+	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
 
 	// Manually create a plan with a file that will use the hanging server
 	plan := &DownloadPlan{
@@ -392,4 +388,45 @@ func verifyFileContent(t *testing.T, path, expectedContent string) {
 	require.NoError(err, "Failed to read file %s", path)
 
 	assert.True(string(content) == expectedContent, "Content mismatch for %s. Expected '%s', got '%s'", path, expectedContent, string(content))
+}
+
+func TestMultiThreadedMergeVerification(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	// 6MB content to trigger multi-threaded download (threshold is numConnections * 1MB)
+	largeContent := strings.Repeat("A", 6*1024*1024)
+	
+	// Calculate SHA256 for the content
+	hasher := sha256.New()
+	hasher.Write([]byte(largeContent))
+	largeFileSHA := hex.EncodeToString(hasher.Sum(nil))
+
+	mockFiles := map[string]mockFile{
+		"large_merge.bin": {Path: "large_merge.bin", Content: largeContent, SHA256: largeFileSHA, IsLFS: true},
+	}
+	server := setupMockServer(t, mockFiles)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	// Use 2 connections. Threshold = 2 * 1MB = 2MB. 6MB > 2MB, so it will use multi-threaded.
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL), WithConnections(2))
+
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+
+	err = d.ExecutePlan(context.Background(), plan)
+	require.NoError(err, "")
+
+	// Verify the merged file exists and has the correct content
+	repoPath := d.getModelPath(mockRepoID)
+	finalPath := filepath.Join(repoPath, "large_merge.bin")
+	verifyFileContent(t, finalPath, largeContent)
+	
+	// Ensure no .tmp files are left behind in the model directory
+	matches, _ := filepath.Glob(filepath.Join(repoPath, "*.tmp"))
+	assert.True(len(matches) == 0, "Expected no .tmp files to be left behind, found: %v", matches)
 }

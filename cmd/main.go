@@ -118,7 +118,7 @@ func (app *cliApp) run(args []string) error {
 	fs.BoolVar(&quiet, "q", false, "Quiet mode (suppress progress display and prompts)")
 	fs.BoolVar(&force, "f", false, "Force re-download of all files, implies quiet mode")
 	fs.BoolVar(&useTree, "tree", false, "Use nested tree structure for output directory (e.g. 'org/model')")
-	fs.StringVar(&includePatterns, "include", "", "Comma-separated glob patterns for files to download")
+	fs.StringVar(&includePatterns, "include", "", "Comma-separated glob patterns for files to download, e.g., '*Q8_0*'")
 	fs.StringVar(&excludePatterns, "exclude", "", "Comma-separated glob patterns for files to exclude")
 	fs.BoolVar(&showVersion, "version", false, "Show version information")
 	fs.BoolVar(&verbose, "v", false, "Enable verbose diagnostic logging to stderr")
@@ -178,7 +178,6 @@ func (app *cliApp) run(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	downer := app.newDownloader(repoName, opts...)
-
 	fmt.Fprintln(app.err, "Fetching repository information...")
 	repoInfo, err := downer.FetchRepoInfo(ctx)
 	if err != nil {
@@ -200,7 +199,7 @@ func (app *cliApp) run(args []string) error {
 		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
-			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize)
+			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize, dest)
 		})
 	}
 
@@ -221,7 +220,6 @@ func (app *cliApp) run(args []string) error {
 
 		if !force && !quiet {
 			fmt.Fprint(app.err, "Would you like to force a re-download anyway? [y/N]: ")
-			// --- FIX: Use the shared reader ---
 			input, _ := stdinReader.ReadString('\n')
 			if strings.TrimSpace(strings.ToLower(input)) == "y" {
 				log.Println("Forcing re-download as requested...")
@@ -232,7 +230,6 @@ func (app *cliApp) run(args []string) error {
 				plan.FilesToSkip = nil
 				plan.TotalSkipSize = 0
 			} else {
-				log.Println("Exiting.")
 				return nil
 			}
 		} else {
@@ -244,6 +241,7 @@ func (app *cliApp) run(args []string) error {
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 		fmt.Fprintf(app.err, "Repository:    %s\n", plan.Repo.ID)
 		fmt.Fprintf(app.err, "Last Modified: %s\n", plan.Repo.LastModified.Format(time.RFC1123))
+		fmt.Fprintf(app.err, "Destination: %s\n", dest)
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 
 		if len(plan.FilesToSkip) > 0 {
@@ -266,10 +264,8 @@ func (app *cliApp) run(args []string) error {
 		fmt.Fprintf(app.err, "Total download size: %s\n", formatBytes(plan.TotalDownloadSize))
 		fmt.Fprint(app.err, "Proceed with download? [y/N]: ")
 
-		// --- FIX: Use the shared reader ---
 		input, _ := stdinReader.ReadString('\n')
 		if strings.TrimSpace(strings.ToLower(input)) != "y" {
-			log.Println("Download cancelled by user.")
 			return nil
 		}
 	}
@@ -284,7 +280,6 @@ func (app *cliApp) run(args []string) error {
 		})
 	}
 
-	log.Println("Starting download...")
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
@@ -306,7 +301,6 @@ func (app *cliApp) run(args []string) error {
 		return lastErr
 	}
 
-	log.Printf("\nDownload of %s completed.", repoName)
 	return nil
 }
 
@@ -316,7 +310,7 @@ type fileProgressState struct {
 	state          hfg.ProgressState
 }
 
-func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd int, totalAnalysisSize int64) {
+func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd int, totalAnalysisSize int64, dest string) {
 	fileStates := make(map[string]*fileProgressState)
 	var lastActiveFile string
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -327,7 +321,7 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 		case pr, ok := <-progressChan:
 			if !ok {
 				fmt.Fprint(out, clearLine)
-				fmt.Fprintln(out, "Analysis complete.")
+				fmt.Fprintln(out, dest)
 				return
 			}
 			lastActiveFile = pr.Filepath
@@ -529,8 +523,7 @@ func isTransientError(err error) bool {
 		return true
 	}
 
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[net.Error](err); ok {
 		return netErr.Timeout()
 	}
 
