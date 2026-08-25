@@ -93,7 +93,8 @@ func WithForceRedownload() Option {
 	}
 }
 
-// WithTreeStructure enables saving to a nested directory structure (e.g., org/model).
+// WithTreeStructure enables saving under nested repo/model_name directories
+// (e.g. "org/model") instead of a flattened "org_model" folder.
 func WithTreeStructure() Option {
 	return func(d *Downloader) {
 		d.useTreeStructure = true

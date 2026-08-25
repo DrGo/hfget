@@ -108,6 +108,25 @@ func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 	})
 	return httptest.NewServer(handler)
 }
+func TestGetModelPath(t *testing.T) {
+	assert := testutils.NewAssert(t)
+	tmpDir := t.TempDir()
+
+	flat := New(mockRepoID, WithDestination(tmpDir))
+	assert.True(flat.getModelPath(mockRepoID) == filepath.Join(tmpDir, "test_repo"),
+		"Expected flat path test_repo, got %s", flat.getModelPath(mockRepoID))
+
+	tree := New(mockRepoID, WithDestination(tmpDir), WithTreeStructure())
+	assert.True(tree.getModelPath(mockRepoID) == filepath.Join(tmpDir, "test", "repo"),
+		"Expected tree path test/repo, got %s", tree.getModelPath(mockRepoID))
+
+	canonical := "google-bert/bert-base-uncased"
+	assert.True(ModelDir(tmpDir, canonical, false) == filepath.Join(tmpDir, "google-bert_bert-base-uncased"),
+		"Expected flattened canonical path, got %s", ModelDir(tmpDir, canonical, false))
+	assert.True(ModelDir(tmpDir, canonical, true) == filepath.Join(tmpDir, "google-bert", "bert-base-uncased"),
+		"Expected nested canonical path, got %s", ModelDir(tmpDir, canonical, true))
+}
+
 func TestFetchRepoInfo(t *testing.T) {
 	require := testutils.NewRequire(t)
 	assert := testutils.NewAssert(t)
@@ -118,7 +137,7 @@ func TestFetchRepoInfo(t *testing.T) {
 	}
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
-d := New(mockRepoID, WithBaseURL(server.URL))
+	d := New(mockRepoID, WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 
@@ -198,7 +217,7 @@ func TestExecutePlan(t *testing.T) {
 	server := setupMockServer(t, mockFiles)
 	defer server.Close()
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
@@ -226,7 +245,7 @@ func TestExecutePlan_ContinueOnError(t *testing.T) {
 	defer server.Close()
 
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info) // All files will be planned for download
@@ -359,7 +378,7 @@ func TestTimeoutHandling(t *testing.T) {
 	defer server.Close()
 
 	tmpDir := t.TempDir()
-	d := New(mockRepoID, WithDestination(tmpDir),  WithBaseURL(server.URL))
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
 
 	// Manually create a plan with a file that will use the hanging server
 	plan := &DownloadPlan{
@@ -396,7 +415,7 @@ func TestMultiThreadedMergeVerification(t *testing.T) {
 
 	// 6MB content to trigger multi-threaded download (threshold is numConnections * 1MB)
 	largeContent := strings.Repeat("A", 6*1024*1024)
-	
+
 	// Calculate SHA256 for the content
 	hasher := sha256.New()
 	hasher.Write([]byte(largeContent))
@@ -425,7 +444,7 @@ func TestMultiThreadedMergeVerification(t *testing.T) {
 	repoPath := d.getModelPath(mockRepoID)
 	finalPath := filepath.Join(repoPath, "large_merge.bin")
 	verifyFileContent(t, finalPath, largeContent)
-	
+
 	// Ensure no .tmp files are left behind in the model directory
 	matches, _ := filepath.Glob(filepath.Join(repoPath, "*.tmp"))
 	assert.True(len(matches) == 0, "Expected no .tmp files to be left behind, found: %v", matches)

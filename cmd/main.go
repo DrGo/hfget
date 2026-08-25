@@ -24,9 +24,31 @@ import (
 var VERSION = ""
 
 const (
-	moveUp    = "\033[A"
-	clearLine = "\r\033[2K"
+	moveUp            = "\033[A"
+	clearLine         = "\r\033[2K"
+	interruptExitCode = 130
 )
+
+var errInterrupted = errors.New("interrupted")
+
+// legacyLongNames maps the single-letter long names advertised by older
+// --help output onto the current names so --d, --c, etc. keep working.
+var legacyLongNames = map[string]string{
+	"b": "branch",
+	"d": "dest",
+	"c": "connections",
+	"t": "token",
+	"q": "quiet",
+	"f": "force",
+	"v": "verbose",
+}
+
+func normalizeFlag(_ *flag.FlagSet, name string) flag.NormalizedName {
+	if canonical, ok := legacyLongNames[name]; ok {
+		return flag.NormalizedName(canonical)
+	}
+	return flag.NormalizedName(name)
+}
 
 // interface to facilitate testing
 type downloader interface {
@@ -57,6 +79,8 @@ type cliApp struct {
 	err           io.Writer
 	isTerminal    bool
 	terminalFd    int
+	ctx           context.Context
+	exit          func(int)
 	newDownloader func(repoName string, opts ...hfg.Option) downloader
 }
 
@@ -72,10 +96,23 @@ func main() {
 			return &realDownloader{Downloader: hfg.New(repoName, opts...)}
 		},
 	}
+	ctx, stop := app.withInterrupt(context.Background())
+	defer stop()
+	app.ctx = ctx
 	if err := app.run(os.Args[1:]); err != nil {
+		if errors.Is(err, errInterrupted) {
+			os.Exit(interruptExitCode)
+		}
 		log.New(app.err, "", 0).Printf("Error:\n%v", err)
 		os.Exit(1)
 	}
+}
+
+func (app *cliApp) runContext() context.Context {
+	if app.ctx != nil {
+		return app.ctx
+	}
+	return context.Background()
 }
 
 func (app *cliApp) run(args []string) error {
@@ -94,6 +131,7 @@ func (app *cliApp) run(args []string) error {
 		maxRetries      int
 		retryInterval   time.Duration
 		quiet           bool
+		yes             bool
 		force           bool
 		useTree         bool
 		includePatterns string
@@ -104,24 +142,26 @@ func (app *cliApp) run(args []string) error {
 
 	fs := flag.NewFlagSet("hfget", flag.ContinueOnError)
 	fs.SetOutput(app.err)
+	fs.SetNormalizeFunc(normalizeFlag)
 
 	fs.BoolVar(&isDatasetFlag, "dataset", false, "Specify that the repo is a dataset")
-	fs.StringVar(&branch, "b", envOrDefault("HFGET_BRANCH", "main"), "Branch of the model or dataset ($HFGET_BRANCH)")
-	fs.StringVar(&dest, "d", envOrDefault("HFGET_DEST", "./"), "Destination path for downloads ($HFGET_DEST)")
+	fs.StringVarP(&branch, "branch", "b", envOrDefault("HFGET_BRANCH", "main"), "Branch of the model or dataset ($HFGET_BRANCH)")
+	fs.StringVarP(&dest, "dest", "d", envOrDefault("HFGET_DEST", "./"), "Destination base path for downloads ($HFGET_DEST)")
 	defaultConnections, _ := strconv.Atoi(envOrDefault("HFGET_CONCURRENT_CONNECTIONS", "5"))
-	fs.IntVar(&numConnections, "c", defaultConnections, "Number of concurrent connections ($HFGET_CONCURRENT_CONNECTIONS)")
-	fs.StringVar(&token, "t", envOrDefault("HFGET_TOKEN", ""), "HuggingFace Auth Token ($HFGET_TOKEN)")
+	fs.IntVarP(&numConnections, "connections", "c", defaultConnections, "Number of concurrent connections ($HFGET_CONCURRENT_CONNECTIONS)")
+	fs.StringVarP(&token, "token", "t", envOrDefault("HFGET_TOKEN", ""), "HuggingFace Auth Token ($HFGET_TOKEN)")
 	defaultSkipChecksum, _ := strconv.ParseBool(envOrDefault("HFGET_SKIP_CHECKSUM", "false"))
 	fs.BoolVar(&skipChecksum, "skip-checksum", defaultSkipChecksum, "Skip SHA256 checksum verification ($HFGET_SKIP_CHECKSUM)")
 	fs.IntVar(&maxRetries, "max-retries", 3, "Maximum number of retries")
 	fs.DurationVar(&retryInterval, "retry-interval", 5*time.Second, "Interval between retries")
-	fs.BoolVar(&quiet, "q", false, "Quiet mode (suppress progress display and prompts)")
-	fs.BoolVar(&force, "f", false, "Force re-download of all files, implies quiet mode")
-	fs.BoolVar(&useTree, "tree", false, "Use nested tree structure for output directory (e.g. 'org/model')")
+	fs.BoolVarP(&quiet, "quiet", "q", false, "Quiet mode (suppress progress display and prompts)")
+	fs.BoolVarP(&yes, "yes", "y", false, "Skip the proceed prompt; does not force a re-download (use -f). Keeps progress display")
+	fs.BoolVarP(&force, "force", "f", false, "Force re-download of all files, implies quiet mode")
+	fs.BoolVar(&useTree, "tree", false, "Save under nested repo/model_name directories (e.g. 'org/model' instead of 'org_model')")
 	fs.StringVar(&includePatterns, "include", "", "Comma-separated glob patterns for files to download, e.g., '*Q8_0*'")
 	fs.StringVar(&excludePatterns, "exclude", "", "Comma-separated glob patterns for files to exclude")
 	fs.BoolVar(&showVersion, "version", false, "Show version information")
-	fs.BoolVar(&verbose, "v", false, "Enable verbose diagnostic logging to stderr")
+	fs.BoolVarP(&verbose, "verbose", "v", false, "Enable verbose diagnostic logging to stderr")
 
 	fs.Usage = func() {
 		fmt.Fprintf(app.err, "Usage: %s [options] model_or_dataset_name\n", os.Args[0])
@@ -131,7 +171,10 @@ func (app *cliApp) run(args []string) error {
 	}
 
 	if err := fs.Parse(args); err != nil {
-		return nil
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
 	}
 
 	if showVersion {
@@ -144,6 +187,8 @@ func (app *cliApp) run(args []string) error {
 	}
 	repoName := fs.Arg(0)
 
+	// Non-interactive terminals and --force suppress prompts/progress.
+	// --yes only auto-confirms prompts; progress still shows unless --quiet.
 	if !app.isTerminal || force {
 		quiet = true
 	}
@@ -175,14 +220,18 @@ func (app *cliApp) run(args []string) error {
 	if verbose {
 		opts = append(opts, hfg.WithVerboseOutput(app.err))
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	ctx := app.runContext()
 	downer := app.newDownloader(repoName, opts...)
 	fmt.Fprintln(app.err, "Fetching repository information...")
 	repoInfo, err := downer.FetchRepoInfo(ctx)
 	if err != nil {
+		if cerr := app.ifCancelled(err); cerr != nil {
+			return cerr
+		}
 		return fmt.Errorf("could not fetch repository info: %w", err)
 	}
+
+	effectiveDest := hfg.ModelDir(dest, repoInfo.ID, useTree)
 
 	var wg sync.WaitGroup
 	var progressChan chan hfg.Progress
@@ -199,16 +248,19 @@ func (app *cliApp) run(args []string) error {
 		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
-			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize, dest)
+			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize, effectiveDest)
 		})
 	}
 
-	plan, err := downer.BuildPlan(context.Background(), repoInfo)
+	plan, err := downer.BuildPlan(ctx, repoInfo)
 	if !quiet {
 		close(progressChan)
 		wg.Wait()
 	}
 	if err != nil {
+		if cerr := app.ifCancelled(err); cerr != nil {
+			return cerr
+		}
 		return fmt.Errorf("could not build download plan: %w", err)
 	}
 
@@ -218,10 +270,17 @@ func (app *cliApp) run(args []string) error {
 		}
 		log.Println("Nothing to download.")
 
-		if !force && !quiet {
-			fmt.Fprint(app.err, "Would you like to force a re-download anyway? [y/N]: ")
-			input, _ := stdinReader.ReadString('\n')
-			if strings.TrimSpace(strings.ToLower(input)) == "y" {
+		// Interactive only: offer an optional force re-download. -y / -q / non-TTY
+		// treat "nothing to do" as success (use -f to force re-download unattended).
+		if !force && !quiet && !yes {
+			ok, cerr := app.confirm(ctx, stdinReader, "Would you like to force a re-download anyway? [y/N]: ")
+			if cerr != nil {
+				if err := app.ifCancelled(cerr); err != nil {
+					return err
+				}
+				return nil
+			}
+			if ok {
 				log.Println("Forcing re-download as requested...")
 				for _, skippedFile := range plan.FilesToSkip {
 					plan.FilesToDownload = append(plan.FilesToDownload, hfg.FileDownload{File: skippedFile.File, Reason: "forced re-download"})
@@ -241,7 +300,7 @@ func (app *cliApp) run(args []string) error {
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 		fmt.Fprintf(app.err, "Repository:    %s\n", plan.Repo.ID)
 		fmt.Fprintf(app.err, "Last Modified: %s\n", plan.Repo.LastModified.Format(time.RFC1123))
-		fmt.Fprintf(app.err, "Destination: %s\n", dest)
+		fmt.Fprintf(app.err, "Destination:   %s\n", effectiveDest)
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 
 		if len(plan.FilesToSkip) > 0 {
@@ -262,11 +321,19 @@ func (app *cliApp) run(args []string) error {
 
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 		fmt.Fprintf(app.err, "Total download size: %s\n", formatBytes(plan.TotalDownloadSize))
-		fmt.Fprint(app.err, "Proceed with download? [y/N]: ")
-
-		input, _ := stdinReader.ReadString('\n')
-		if strings.TrimSpace(strings.ToLower(input)) != "y" {
-			return nil
+		if !yes {
+			ok, cerr := app.confirm(ctx, stdinReader, "Proceed with download? [y/N]: ")
+			if cerr != nil {
+				if err := app.ifCancelled(cerr); err != nil {
+					return err
+				}
+				return nil
+			}
+			if !ok {
+				return nil
+			}
+		} else {
+			fmt.Fprintln(app.err, "Proceeding with download (-y).")
 		}
 	}
 
@@ -276,18 +343,37 @@ func (app *cliApp) run(args []string) error {
 		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
-			downloadDisplayProgress(app.err, progressChan, app.terminalFd, plan)
+			downloadDisplayProgress(ctx, app.err, progressChan, app.terminalFd, plan)
 		})
 	}
 
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
+		}
 		if i > 0 {
 			log.Printf("Retrying after transient error (attempt %d/%d)...", i+1, maxRetries)
-			time.Sleep(retryInterval)
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+			case <-time.After(retryInterval):
+			}
+			if ctx.Err() != nil {
+				lastErr = ctx.Err()
+				break
+			}
 		}
-		lastErr = downer.ExecutePlan(context.Background(), plan)
-		if lastErr == nil || !isTransientError(lastErr) {
+		lastErr = downer.ExecutePlan(ctx, plan)
+		if lastErr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
+		if !isTransientError(lastErr) {
 			break
 		}
 	}
@@ -298,6 +384,9 @@ func (app *cliApp) run(args []string) error {
 	}
 
 	if lastErr != nil {
+		if cerr := app.ifCancelled(lastErr); cerr != nil {
+			return cerr
+		}
 		return lastErr
 	}
 
@@ -365,7 +454,7 @@ type speedSample struct {
 	bytes int64
 }
 
-func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd int, plan *hfg.DownloadPlan) {
+func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-chan hfg.Progress, fd int, plan *hfg.DownloadPlan) {
 	totalDownloadSize := plan.TotalDownloadSize
 	var totalDownloaded, recentBytes int64
 	fileStates := make(map[string]*fileProgressState)
@@ -389,6 +478,9 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 					fmt.Fprint(out, moveUp+clearLine)
 				}
 				fmt.Fprint(out, "\r")
+				if ctx.Err() != nil {
+					return
+				}
 				fmt.Printf("Overall: 100.0%% (%s/%s) | Complete.\n\n", formatBytes(totalDownloadSize), formatBytes(totalDownloadSize))
 				return
 			}
@@ -502,6 +594,75 @@ func downloadDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 			linesPrinted = 2
 		}
 	}
+}
+
+func (app *cliApp) withInterrupt(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	stopCh := make(chan struct{})
+	go watchSignals(cancel, sigCh, stopCh, app.err, app.exit)
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			signal.Stop(sigCh)
+			close(stopCh)
+			cancel()
+		})
+	}
+}
+
+func watchSignals(cancel context.CancelFunc, sig <-chan os.Signal, stop <-chan struct{}, out io.Writer, exit func(int)) {
+	if exit == nil {
+		exit = os.Exit
+	}
+	select {
+	case <-stop:
+		return
+	case <-sig:
+	}
+	fmt.Fprintln(out, "\nInterrupt received. Press Ctrl+C again to force quit.")
+	cancel()
+	select {
+	case <-stop:
+		return
+	case <-sig:
+		fmt.Fprintln(out, "Forced quit.")
+		exit(interruptExitCode)
+	}
+}
+
+func (app *cliApp) confirm(ctx context.Context, r *bufio.Reader, prompt string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	fmt.Fprint(app.err, prompt)
+	type reply struct {
+		line string
+		err  error
+	}
+	ch := make(chan reply, 1)
+	go func() {
+		line, err := r.ReadString('\n')
+		ch <- reply{line, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			return false, res.err
+		}
+		return strings.TrimSpace(strings.ToLower(res.line)) == "y", nil
+	}
+}
+
+func (app *cliApp) ifCancelled(err error) error {
+	if err != nil && errors.Is(err, context.Canceled) {
+		fmt.Fprintln(app.err, "Cancelled.")
+		return errInterrupted
+	}
+	return nil
 }
 
 func envOrDefault(key, defaultValue string) string {

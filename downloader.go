@@ -151,14 +151,17 @@ func (d *Downloader) setLogger(w io.Writer) {
 	d.logger.SetOutput(w)
 }
 
-func (d *Downloader) getModelPath(repoID string) string {
-	var modelFolderName string
-	if d.useTreeStructure {
-		modelFolderName = repoID
-	} else {
-		modelFolderName = strings.ReplaceAll(repoID, "/", "_")
+// ModelDir returns the local folder for a repo ID under base: "org_model",
+// or "org/model" when tree is true.
+func ModelDir(base, repoID string, tree bool) string {
+	if !tree {
+		repoID = strings.ReplaceAll(repoID, "/", "_")
 	}
-	return filepath.Join(d.destinationBasePath, modelFolderName)
+	return filepath.Join(base, repoID)
+}
+
+func (d *Downloader) getModelPath(repoID string) string {
+	return ModelDir(d.destinationBasePath, repoID, d.useTreeStructure)
 }
 
 // FetchRepoInfo gets all remote file metadata from the Hugging Face API.

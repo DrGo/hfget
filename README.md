@@ -59,8 +59,13 @@ failure will not stop the entire download job.
 * **Accurate Progress Display:** Provides smooth, accurate progress bars for 
 both the initial file analysis and the download phases.
 * **Interactive & Scriptable:** Provides an interactive summary and 
-confirmation prompt for manual use, which is automatically bypassed when not 
-run in a terminal or when using the `--force` flag.
+confirmation prompt for manual use. Use `-y` / `--yes` to skip the proceed 
+prompt while still showing progress; it does not force a re-download (use 
+`-f`). Prompts are also bypassed when not run in a terminal or when using 
+`--force` / `--quiet`. Press Ctrl+C once to cancel in-flight work, or twice 
+to force quit.
+* **Flexible Layout:** By default files land in a flat `org_model` folder; 
+pass `--tree` to keep the Hugging Face layout as `org/model` (`repo/model_name`).
 * **Verbose Logging:** An optional `--verbose` flag provides detailed 
 diagnostic output for troubleshooting.
 * **Lightweight & Portable:** The compiled binary is self-contained and works 
@@ -118,7 +123,7 @@ Using the `-d` flag specifies the destination directory. (The long form is
 `--dest`).
 
 ```sh
-# This will save files to the 'my_models' directory
+# Saves under ./my_models/imdatta0_nanollama
 hfget -d ./my_models imdatta0/nanollama
 ```
 
@@ -143,10 +148,35 @@ hfget imdatta0/nanollama --include "*.Q4_K_M.gguf,*.Q5_K_M.gguf"
 hfget imdatta0/nanollama --exclude "*.safetensors"
 ```
 
-**5. Force a Re-download**
+**5. Unattended Download (yes to prompts)**
+
+Use `-y` / `--yes` for scripted or unattended runs: the proceed prompt is 
+skipped, but progress output is still shown (unlike `--quiet`). Already-valid 
+files are still skipped; use `-f` / `--force` to re-download them.
+
+```sh
+hfget -y imdatta0/nanollama
+```
+
+**6. Nested `repo/model_name` Directory Layout**
+
+By default, `imdatta0/nanollama` is saved under `./imdatta0_nanollama`. With 
+`--tree`, it is saved under `./imdatta0/nanollama` (owner/name nesting). Combine 
+with `-d` to place that tree under another base directory.
+
+```sh
+# Saves to ./imdatta0/nanollama/...
+hfget --tree imdatta0/nanollama
+
+# Saves to ./models/imdatta0/nanollama/...
+hfget --tree -d ./models imdatta0/nanollama
+```
+
+**7. Force a Re-download**
 
 To re-download all files from a repository, regardless of their local state, 
-use the `-f` flag. This will also skip all interactive prompts.
+use the `-f` flag. This will also skip all interactive prompts and suppress 
+progress (quiet mode).
 
 ```sh
 hfget -f imdatta0/nanollama
@@ -155,21 +185,23 @@ hfget -f imdatta0/nanollama
 ### Command-Line Flags
 
 Flags can also be set via environment variables (e.g., setting `HFGET_TOKEN` 
-instead of using the `-t` flag).
+instead of using the `-t` flag). Older single-letter long names (`--d`, `--c`, 
+`--t`, `--b`, `--q`, `--f`, `--v`) are still accepted as aliases.
 | Flag | Shorthand | Environment Variable | Description | Default |
 | :--- | :--- | :--- | :--- | :--- |
 | `--dataset` | | | Specify that the repository is a dataset. | `false` |
 | `--branch` | `-b` | `HFGET_BRANCH` | The repository branch to download from. | `"main"` |
-| `--dest` | `-d` | `HFGET_DEST` | The local directory where files will be saved. | `"./"` |
-| | `-c` | `HFGET_CONCURRENT_CONNECTIONS` | Number of concurrent connections for downloading. | `5` |
+| `--dest` | `-d` | `HFGET_DEST` | Base directory for downloads (model folder is created inside). | `"./"` |
+| `--connections` | `-c` | `HFGET_CONCURRENT_CONNECTIONS` | Number of concurrent connections for downloading. | `5` |
 | `--token` | `-t` | `HFGET_TOKEN` | Your Hugging Face auth token. | `""` |
 | `--skip-checksum`| | `HFGET_SKIP_CHECKSUM` | Skip SHA256 checksum verification. | `false` |
-| `--tree` | | | Use nested tree structure for output directory. | `false` |
+| `--tree` | | | Save under nested `repo/model_name` dirs instead of `repo_model_name`. | `false` |
 | `--include` | | | Comma-separated glob patterns for files to include. | `""` |
 | `--exclude` | | | Comma-separated glob patterns for files to exclude. | `""` |
 | `--max-retries` | | | Maximum retries on transient network errors. | `3` |
 | `--retry-interval` | | | The time to wait between retries. | `5s` |
 | `--quiet` | `-q` | | Suppress interactive progress and prompts. | `false` |
+| `--yes` | `-y` | | Skip the proceed prompt; does not force a re-download (use `-f`). Keeps progress. | `false` |
 | `--force` | `-f` | | Force re-download of all files (implies `--quiet`). | `false` |
 | `--verbose` | `-v` | | Enable verbose diagnostic logging to stderr. | `false` |
 | `--version` | | | Show version information and exit. | `false` |

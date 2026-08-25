@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,9 @@ type mockDownloader struct {
 }
 
 func (m *mockDownloader) FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.fetchRepoInfoCalls++
 	if m.repoInfoToReturn == nil {
 		return &hfg.RepoInfo{ID: "test/repo"}, m.fetchErr
@@ -40,6 +45,9 @@ func (m *mockDownloader) FetchRepoInfo(ctx context.Context) (*hfg.RepoInfo, erro
 }
 
 func (m *mockDownloader) BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) (*hfg.DownloadPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.buildPlanCalls++
 	if m.planToReturn == nil {
 		return &hfg.DownloadPlan{Repo: repoInfo}, m.buildErr
@@ -48,6 +56,9 @@ func (m *mockDownloader) BuildPlan(ctx context.Context, repoInfo *hfg.RepoInfo) 
 }
 
 func (m *mockDownloader) ExecutePlan(ctx context.Context, plan *hfg.DownloadPlan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.executePlanCalls++
 	if m.executePlanCalls <= m.executePlanFailures {
 		return m.executeErr
@@ -94,17 +105,27 @@ func TestCLI(t *testing.T) {
 		require.True(strings.Contains(err.Error(), "argument is required"), "Expected error message to contain 'argument is required', got: %v", err)
 	})
 
+	// Regression: unknown short flags used to be swallowed (return nil), so
+	// e.g. an unsupported -y would exit 0 immediately with no download.
+	t.Run("Unknown shorthand flag returns error", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		app := &cliApp{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
+		err := app.run([]string{"-z", "test/repo"})
+		require.Error(err, "Expected an error for unknown shorthand flag, but got none")
+	})
+
 	t.Run("Force flag implies quiet and skips prompt", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		assert := testutils.NewAssert(t)
 		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
 		mock := &mockDownloader{
 			repoInfoToReturn: defaultRepoInfo,
 			planToReturn:     defaultPlan,
 		}
 		app := &cliApp{
 			out:           out,
-			err:           &bytes.Buffer{},
+			err:           errOut,
 			newDownloader: func(string, ...hfg.Option) downloader { return mock },
 		}
 
@@ -112,8 +133,57 @@ func TestCLI(t *testing.T) {
 		err := app.run([]string{"-f", "test/repo"})
 		require.NoError(err, "Expected no error for forced download")
 		// There should be no interactive prompt in the output
-		assert.False(strings.Contains(out.String(), "Proceed with download? [y/N]:"), "Expected force flag to skip the confirmation prompt")
+		assert.False(strings.Contains(errOut.String(), "Proceed with download? [y/N]:"), "Expected force flag to skip the confirmation prompt")
 		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
+	})
+
+	t.Run("Yes flag skips confirmation but keeps progress path", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		out := &bytes.Buffer{}
+		errOut := &bytes.Buffer{}
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     defaultPlan,
+		}
+		app := &cliApp{
+			out:           out,
+			err:           errOut,
+			isTerminal:    true, // terminal so quiet is not auto-enabled
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-y", "test/repo"})
+		require.NoError(err, "Expected no error with -y")
+		assert.False(strings.Contains(errOut.String(), "Proceed with download? [y/N]:"), "Expected -y to skip the confirmation prompt")
+		assert.True(strings.Contains(errOut.String(), "Proceeding with download (-y)."), "Expected -y proceed message")
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
+	})
+
+	t.Run("Yes flag exits when nothing to download without re-download", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		emptyPlan := &hfg.DownloadPlan{
+			Repo:        defaultRepoInfo,
+			FilesToSkip: []hfg.FileSkip{{File: hfg.HFFile{Path: "file1.txt"}}},
+		}
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     emptyPlan,
+		}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			isTerminal:    true,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-y", "test/repo"})
+		require.NoError(err, "Expected no error when nothing to download with -y")
+		assert.True(strings.Contains(errOut.String(), "Nothing to download."), "Expected nothing-to-download message")
+		assert.False(strings.Contains(errOut.String(), "Would you like to force a re-download"), "Expected -y not to offer re-download")
+		assert.True(mock.executePlanCalls == 0, "Expected ExecutePlan not to be called, but was called %d times", mock.executePlanCalls)
 	})
 
 	t.Run("No files to download, exits gracefully", func(t *testing.T) {
@@ -214,5 +284,157 @@ func TestCLI(t *testing.T) {
 		require.Error(err, "Expected a fatal error, but got none")
 
 		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called only once, but was called %d times", mock.executePlanCalls)
+	})
+
+	t.Run("Destination uses canonical repo ID not CLI argument", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		canonical := &hfg.RepoInfo{ID: "google-bert/bert-base-uncased", LastModified: time.Now()}
+		plan := &hfg.DownloadPlan{
+			Repo: canonical,
+			FilesToDownload: []hfg.FileDownload{
+				{File: hfg.HFFile{Path: "config.json", Size: 100}, Reason: "missing"},
+			},
+			TotalDownloadSize: 100,
+		}
+		mock := &mockDownloader{repoInfoToReturn: canonical, planToReturn: plan}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			isTerminal:    true,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-y", "-d", "./models", "bert-base-uncased"})
+		require.NoError(err, "Expected no error for canonical-id destination")
+		want := "Destination:   " + filepath.Join("models", "google-bert_bert-base-uncased")
+		assert.True(strings.Contains(errOut.String(), want), "Expected destination %q in output, got: %s", want, errOut.String())
+		assert.False(strings.Contains(errOut.String(), "Destination:   "+filepath.Join("models", "bert-base-uncased")),
+			"Destination should not use the unresolved CLI repo name")
+	})
+
+	t.Run("Destination with --tree uses nested canonical ID", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		canonical := &hfg.RepoInfo{ID: "google-bert/bert-base-uncased", LastModified: time.Now()}
+		plan := &hfg.DownloadPlan{
+			Repo: canonical,
+			FilesToDownload: []hfg.FileDownload{
+				{File: hfg.HFFile{Path: "config.json", Size: 100}, Reason: "missing"},
+			},
+			TotalDownloadSize: 100,
+		}
+		mock := &mockDownloader{repoInfoToReturn: canonical, planToReturn: plan}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			isTerminal:    true,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-y", "--tree", "-d", "./models", "bert-base-uncased"})
+		require.NoError(err, "Expected no error for tree destination")
+		want := "Destination:   " + filepath.Join("models", "google-bert", "bert-base-uncased")
+		assert.True(strings.Contains(errOut.String(), want), "Expected destination %q in output, got: %s", want, errOut.String())
+	})
+
+	t.Run("Legacy single-letter long flags still parse", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     defaultPlan,
+		}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           &bytes.Buffer{},
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"--d", "./models", "--c", "2", "--q", "test/repo"})
+		require.NoError(err, "Expected legacy --d/--c/--q to parse, got: %v", err)
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
+	})
+
+	t.Run("Cancelled context stops before execute", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     defaultPlan,
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			ctx:           ctx,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-f", "test/repo"})
+		require.Error(err, "Expected an interrupt error")
+		assert.True(errors.Is(err, errInterrupted), "Expected errInterrupted, got: %v", err)
+		assert.True(strings.Contains(errOut.String(), "Cancelled."), "Expected Cancelled message, got: %s", errOut.String())
+		assert.True(mock.fetchRepoInfoCalls == 0, "Expected FetchRepoInfo not to run, but was called %d times", mock.fetchRepoInfoCalls)
+		assert.True(mock.executePlanCalls == 0, "Expected ExecutePlan not to run, but was called %d times", mock.executePlanCalls)
+	})
+}
+
+func TestWatchSignals(t *testing.T) {
+	t.Run("first signal cancels without exiting", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		errOut := &bytes.Buffer{}
+		exited := make(chan int, 1)
+
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
+		sig <- os.Interrupt
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("first signal did not cancel the context")
+		}
+		require.True(strings.Contains(errOut.String(), "Interrupt received"), "Expected first-interrupt message, got: %s", errOut.String())
+		assert.True(strings.Contains(errOut.String(), "Press Ctrl+C again to force quit"), "Expected force-quit hint, got: %s", errOut.String())
+
+		select {
+		case code := <-exited:
+			t.Fatalf("first signal should not force-exit, got code %d", code)
+		case <-time.After(30 * time.Millisecond):
+		}
+		close(stop)
+	})
+
+	t.Run("second signal force exits", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		defer close(stop)
+		errOut := &bytes.Buffer{}
+		exited := make(chan int, 1)
+
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
+		sig <- os.Interrupt
+		<-ctx.Done()
+		sig <- os.Interrupt
+
+		select {
+		case code := <-exited:
+			require.True(code == interruptExitCode, "Expected exit code %d, got %d", interruptExitCode, code)
+		case <-time.After(time.Second):
+			t.Fatal("second signal did not force-exit")
+		}
+		require.True(strings.Contains(errOut.String(), "Forced quit."), "Expected forced-quit message, got: %s", errOut.String())
 	})
 }
