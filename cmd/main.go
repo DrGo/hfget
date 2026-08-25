@@ -321,6 +321,16 @@ func (app *cliApp) run(args []string) error {
 
 		fmt.Fprintln(app.err, "----------------------------------------------------")
 		fmt.Fprintf(app.err, "Total download size: %s\n", formatBytes(plan.TotalDownloadSize))
+		if avail, spaceErr := hfg.AvailableSpace(effectiveDest); spaceErr == nil {
+			fmt.Fprintf(app.err, "Available space:     %s\n", formatBytes(avail))
+		}
+	}
+
+	if err := hfg.EnsureWritableSpace(effectiveDest, plan, numConnections); err != nil {
+		return err
+	}
+
+	if !quiet {
 		if !yes {
 			ok, cerr := app.confirm(ctx, stdinReader, "Proceed with download? [y/N]: ")
 			if cerr != nil {
@@ -598,7 +608,9 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 
 func (app *cliApp) withInterrupt(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
-	sigCh := make(chan os.Signal, 2)
+	// Size 1: extra SIGINTs while we are not receiving are dropped instead of
+	// being queued as a fake "second Ctrl+C".
+	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	stopCh := make(chan struct{})
 	go watchSignals(cancel, sigCh, stopCh, app.err, app.exit)
@@ -623,12 +635,25 @@ func watchSignals(cancel context.CancelFunc, sig <-chan os.Signal, stop <-chan s
 	}
 	fmt.Fprintln(out, "\nInterrupt received. Press Ctrl+C again to force quit.")
 	cancel()
+	// One keypress can deliver a duplicate SIGINT (terminal/process-group bounce)
+	// while cancel() runs. Drain it so the first Ctrl+C is not treated as force-quit.
+	drainSignals(sig)
 	select {
 	case <-stop:
 		return
 	case <-sig:
 		fmt.Fprintln(out, "Forced quit.")
 		exit(interruptExitCode)
+	}
+}
+
+func drainSignals(sig <-chan os.Signal) {
+	for {
+		select {
+		case <-sig:
+		default:
+			return
+		}
 	}
 }
 
@@ -650,6 +675,11 @@ func (app *cliApp) confirm(ctx context.Context, r *bufio.Reader, prompt string) 
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case res := <-ch:
+		// Ctrl+C can unblock stdin in the same moment the signal cancels ctx.
+		// Prefer the interrupt so a single SIGINT is not treated as "no" / EOF.
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if res.err != nil {
 			return false, res.err
 		}
@@ -676,7 +706,7 @@ func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) {
+	if errors.Is(err, hfg.ErrAuthentication) || errors.Is(err, hfg.ErrForbidden) || errors.Is(err, hfg.ErrNotFound) || errors.Is(err, hfg.ErrInsufficientSpace) {
 		return false
 	}
 

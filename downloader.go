@@ -266,6 +266,9 @@ func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error 
 	if err := d.prepareOutputDirectory(plan.Repo.ID); err != nil {
 		return err
 	}
+	if err := d.ensureWritableSpace(plan); err != nil {
+		return err
+	}
 	modelPath := d.getModelPath(plan.Repo.ID)
 	var downloadErrors []error
 	for _, fileToDownload := range plan.FilesToDownload {
@@ -329,6 +332,18 @@ func (d *Downloader) prepareOutputDirectory(repoID string) error {
 		return fmt.Errorf("failed to create root model directory %s: %w", modelPath, err)
 	}
 	return nil
+}
+
+func (d *Downloader) ensureWritableSpace(plan *DownloadPlan) error {
+	path := d.getModelPath(plan.Repo.ID)
+	avail, err := AvailableSpace(path)
+	if err != nil {
+		d.logger.Printf("Could not determine available disk space at %s: %v (continuing without a space check)", path, err)
+		return nil
+	}
+	needed := requiredDownloadSpace(plan, d.numConnections)
+	d.logger.Printf("Writable space at %s: available %s, required %s", path, formatBytes(avail), formatBytes(needed))
+	return checkSpace(path, avail, needed)
 }
 
 // aggregateErrors joins multiple download errors into a single error.

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -358,6 +360,54 @@ func TestCLI(t *testing.T) {
 		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
 	})
 
+	t.Run("Shows available space in plan summary", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     defaultPlan,
+		}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			isTerminal:    true,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-y", "test/repo"})
+		require.NoError(err, "Expected no error when space is available")
+		assert.True(strings.Contains(errOut.String(), "Available space:"), "Expected available space in summary, got: %s", errOut.String())
+		assert.True(mock.executePlanCalls == 1, "Expected ExecutePlan to be called once, but was called %d times", mock.executePlanCalls)
+	})
+
+	t.Run("Insufficient disk space aborts before execute", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		errOut := &bytes.Buffer{}
+		hugePlan := &hfg.DownloadPlan{
+			Repo: defaultRepoInfo,
+			FilesToDownload: []hfg.FileDownload{
+				{File: hfg.HFFile{Path: "huge.bin", Size: math.MaxInt64 / 2}},
+			},
+			TotalDownloadSize: math.MaxInt64 / 2,
+		}
+		mock := &mockDownloader{
+			repoInfoToReturn: defaultRepoInfo,
+			planToReturn:     hugePlan,
+		}
+		app := &cliApp{
+			out:           &bytes.Buffer{},
+			err:           errOut,
+			newDownloader: func(string, ...hfg.Option) downloader { return mock },
+		}
+
+		err := app.run([]string{"-f", "test/repo"})
+		require.Error(err, "Expected insufficient space error")
+		assert.True(errors.Is(err, hfg.ErrInsufficientSpace), "Expected ErrInsufficientSpace, got: %v", err)
+		assert.True(mock.executePlanCalls == 0, "Expected ExecutePlan not to run, but was called %d times", mock.executePlanCalls)
+	})
+
 	t.Run("Cancelled context stops before execute", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		assert := testutils.NewAssert(t)
@@ -382,6 +432,36 @@ func TestCLI(t *testing.T) {
 		assert.True(mock.fetchRepoInfoCalls == 0, "Expected FetchRepoInfo not to run, but was called %d times", mock.fetchRepoInfoCalls)
 		assert.True(mock.executePlanCalls == 0, "Expected ExecutePlan not to run, but was called %d times", mock.executePlanCalls)
 	})
+}
+
+func TestConfirmInterruptPrefersContext(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+
+	app := &cliApp{err: io.Discard}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := app.confirm(ctx, bufio.NewReader(pr), "Proceed? [y/N]: ")
+		errCh <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	_, _ = pw.Write([]byte("n\n"))
+
+	select {
+	case err := <-errCh:
+		require.Error(err, "expected confirm to fail on interrupt")
+		assert.True(errors.Is(err, context.Canceled), "expected context.Canceled, got: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("confirm did not return after cancel")
+	}
 }
 
 func TestWatchSignals(t *testing.T) {
@@ -414,6 +494,36 @@ func TestWatchSignals(t *testing.T) {
 		close(stop)
 	})
 
+	t.Run("queued duplicate of first signal does not force-exit", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		assert := testutils.NewAssert(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		errOut := &bytes.Buffer{}
+		exited := make(chan int, 1)
+
+		sig <- os.Interrupt
+		sig <- os.Interrupt
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("first signal did not cancel the context")
+		}
+		require.True(strings.Contains(errOut.String(), "Interrupt received"), "Expected first-interrupt message, got: %s", errOut.String())
+
+		select {
+		case code := <-exited:
+			t.Fatalf("duplicate SIGINT from one keypress should not force-exit, got code %d", code)
+		case <-time.After(50 * time.Millisecond):
+		}
+		assert.False(strings.Contains(errOut.String(), "Forced quit."), "duplicate should not print forced-quit, got: %s", errOut.String())
+		close(stop)
+	})
+
 	t.Run("second signal force exits", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -427,6 +537,9 @@ func TestWatchSignals(t *testing.T) {
 		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
 		sig <- os.Interrupt
 		<-ctx.Done()
+		// Let drainSignals drop any bounce from the first press before the
+		// real second Ctrl+C.
+		time.Sleep(20 * time.Millisecond)
 		sig <- os.Interrupt
 
 		select {
