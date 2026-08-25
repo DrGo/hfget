@@ -29,6 +29,10 @@ const (
 	interruptExitCode = 130
 )
 
+// interruptDebounce drops extra SIGINTs from a single keypress (terminal /
+// process-group bounce) so they cannot count as the second quit press.
+const interruptDebounce = 200 * time.Millisecond
+
 var errInterrupted = errors.New("interrupted")
 
 // legacyLongNames maps the single-letter long names advertised by older
@@ -81,6 +85,7 @@ type cliApp struct {
 	terminalFd    int
 	ctx           context.Context
 	exit          func(int)
+	pause         *outputPause
 	newDownloader func(repoName string, opts ...hfg.Option) downloader
 }
 
@@ -248,7 +253,7 @@ func (app *cliApp) run(args []string) error {
 		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
-			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize, effectiveDest)
+			analysisDisplayProgress(app.err, progressChan, app.terminalFd, totalAnalysisSize, effectiveDest, app.pause)
 		})
 	}
 
@@ -353,7 +358,7 @@ func (app *cliApp) run(args []string) error {
 		downer = app.newDownloader(repoName, optsWithProgress...)
 
 		wg.Go(func() {
-			downloadDisplayProgress(ctx, app.err, progressChan, app.terminalFd, plan)
+			downloadDisplayProgress(ctx, app.err, progressChan, app.terminalFd, plan, app.pause)
 		})
 	}
 
@@ -409,7 +414,49 @@ type fileProgressState struct {
 	state          hfg.ProgressState
 }
 
-func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd int, totalAnalysisSize int64, dest string) {
+// outputPause stops progress redraws so a status line (Ctrl+C hint, cancel)
+// is not overwritten by the next tick. Work continues; only rendering pauses.
+type outputPause struct {
+	mu     sync.Mutex
+	paused bool
+}
+
+func (p *outputPause) Paused() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paused
+}
+
+// Print marks output paused, then writes a line. Progress redraws share this
+// lock so they cannot run after the pause is visible.
+func (p *outputPause) Print(w io.Writer, msg string) {
+	if p == nil {
+		fmt.Fprintln(w, msg)
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.paused = true
+	fmt.Fprintln(w, msg)
+}
+
+func (p *outputPause) writeProgress(w io.Writer, write func(io.Writer)) {
+	if p == nil {
+		write(w)
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.paused {
+		return
+	}
+	write(w)
+}
+
+func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd int, totalAnalysisSize int64, dest string, pause *outputPause) {
 	fileStates := make(map[string]*fileProgressState)
 	var lastActiveFile string
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -419,7 +466,9 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 		select {
 		case pr, ok := <-progressChan:
 			if !ok {
-				fmt.Fprint(out, clearLine)
+				pause.writeProgress(out, func(w io.Writer) {
+					fmt.Fprint(w, clearLine)
+				})
 				fmt.Fprintln(out, dest)
 				return
 			}
@@ -453,8 +502,10 @@ func analysisDisplayProgress(out io.Writer, progressChan <-chan hfg.Progress, fd
 				percent = 100.0
 			}
 
-			fmt.Fprint(out, clearLine)
-			fmt.Fprintf(out, "Analyzing (%.1f%%): Verifying %s", percent, truncateString(lastActiveFile, width-30))
+			pause.writeProgress(out, func(w io.Writer) {
+				fmt.Fprint(w, clearLine)
+				fmt.Fprintf(w, "Analyzing (%.1f%%): Verifying %s", percent, truncateString(lastActiveFile, width-30))
+			})
 		}
 	}
 }
@@ -464,7 +515,50 @@ type speedSample struct {
 	bytes int64
 }
 
-func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-chan hfg.Progress, fd int, plan *hfg.DownloadPlan) {
+type downloadProgressConfig struct {
+	tick          time.Duration
+	diagnoseAfter time.Duration
+	stalledAfter  time.Duration
+	probeEvery    time.Duration
+	host          string
+	diagnose      networkDiagnoseFunc
+	pause         *outputPause
+}
+
+func defaultDownloadProgressConfig() downloadProgressConfig {
+	return downloadProgressConfig{
+		tick:          500 * time.Millisecond,
+		diagnoseAfter: downloadStallAfter,
+		stalledAfter:  downloadStalledAfter,
+		probeEvery:    downloadProbeEvery,
+		host:          huggingfaceHost,
+		diagnose:      diagnoseDownloadStall,
+	}
+}
+
+func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-chan hfg.Progress, fd int, plan *hfg.DownloadPlan, pause *outputPause) {
+	cfg := defaultDownloadProgressConfig()
+	cfg.pause = pause
+	downloadDisplayProgressWith(ctx, out, progressChan, fd, plan, cfg)
+}
+
+func downloadDisplayProgressWith(ctx context.Context, out io.Writer, progressChan <-chan hfg.Progress, fd int, plan *hfg.DownloadPlan, cfg downloadProgressConfig) {
+	if cfg.tick <= 0 {
+		cfg.tick = 500 * time.Millisecond
+	}
+	if cfg.diagnoseAfter <= 0 {
+		cfg.diagnoseAfter = downloadStallAfter
+	}
+	if cfg.stalledAfter <= 0 {
+		cfg.stalledAfter = downloadStalledAfter
+	}
+	if cfg.host == "" {
+		cfg.host = huggingfaceHost
+	}
+	if cfg.diagnose == nil {
+		cfg.diagnose = diagnoseDownloadStall
+	}
+
 	totalDownloadSize := plan.TotalDownloadSize
 	var totalDownloaded, recentBytes int64
 	fileStates := make(map[string]*fileProgressState)
@@ -473,8 +567,15 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 	}
 
 	downloadStartTime := time.Now()
+	lastByteAt := downloadStartTime
+	var hadProgress bool
 	var speedSamples []speedSample
-	ticker := time.NewTicker(500 * time.Millisecond)
+	monitor := stallMonitor{
+		host:     cfg.host,
+		diagnose: cfg.diagnose,
+		interval: cfg.probeEvery,
+	}
+	ticker := time.NewTicker(cfg.tick)
 	defer ticker.Stop()
 
 	var linesPrinted int
@@ -483,11 +584,13 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 		select {
 		case pr, ok := <-progressChan:
 			if !ok {
-				fmt.Fprint(out, clearLine)
-				if linesPrinted > 1 {
-					fmt.Fprint(out, moveUp+clearLine)
-				}
-				fmt.Fprint(out, "\r")
+				cfg.pause.writeProgress(out, func(w io.Writer) {
+					fmt.Fprint(w, clearLine)
+					if linesPrinted > 1 {
+						fmt.Fprint(w, moveUp+clearLine)
+					}
+					fmt.Fprint(w, "\r")
+				})
 				if ctx.Err() != nil {
 					return
 				}
@@ -506,13 +609,21 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 					delta := pr.CurrentSize - state.processedBytes
 					totalDownloaded += delta
 					recentBytes += delta
+					state.processedBytes = pr.CurrentSize
+					lastByteAt = time.Now()
+					hadProgress = true
+					monitor.clear()
 				}
-				state.processedBytes = pr.CurrentSize
+				// Ignore out-of-order or "connecting" updates that would
+				// rewind the cumulative byte count.
 
 			case hfg.ProgressStateComplete, hfg.ProgressStateVerified:
 				if state.processedBytes < state.totalSize {
 					delta := state.totalSize - state.processedBytes
 					totalDownloaded += delta
+					lastByteAt = time.Now()
+					hadProgress = true
+					monitor.clear()
 				}
 				state.processedBytes = state.totalSize
 			}
@@ -521,14 +632,6 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 			width, _, _ := term.GetSize(fd)
 			if width <= 0 {
 				width = 90
-			}
-
-			if linesPrinted > 0 {
-				fmt.Fprint(out, clearLine)
-				if linesPrinted > 1 {
-					fmt.Fprint(out, moveUp+clearLine)
-				}
-				fmt.Fprint(out, "\r")
 			}
 
 			now := time.Now()
@@ -566,9 +669,6 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 			if totalDownloadSize > 0 {
 				overallPercent = (float64(totalDownloaded) * 100) / float64(totalDownloadSize)
 			}
-			line1 := fmt.Sprintf("Overall: %.1f%% (%s/%s) | Avg: %s | Current: %s",
-				overallPercent, formatBytes(totalDownloaded), formatBytes(totalDownloadSize),
-				formatSpeed(avgSpeed), formatSpeed(currentSpeed))
 
 			var activeFile string
 			var activeState *fileProgressState
@@ -580,6 +680,19 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 					break
 				}
 			}
+
+			idle := now.Sub(lastByteAt)
+			if activeState != nil && idle >= cfg.diagnoseAfter {
+				monitor.kick(ctx)
+			}
+			issue, probed := monitor.snapshot()
+			status := formatCurrentField(idle, currentSpeed, hadProgress, probed, issue, cfg.diagnoseAfter, cfg.stalledAfter)
+			if activeState == nil {
+				status = "Current: " + formatSpeed(currentSpeed)
+			}
+			line1 := fmt.Sprintf("Overall: %.1f%% (%s/%s) | Avg: %s | %s",
+				overallPercent, formatBytes(totalDownloaded), formatBytes(totalDownloadSize),
+				formatSpeed(avgSpeed), status)
 
 			var line2 string
 			if activeState != nil && activeFile != "" {
@@ -599,21 +712,33 @@ func downloadDisplayProgress(ctx context.Context, out io.Writer, progressChan <-
 				line2 = line2[:width]
 			}
 
-			fmt.Fprintln(out, line1)
-			fmt.Fprint(out, line2)
-			linesPrinted = 2
+			cfg.pause.writeProgress(out, func(w io.Writer) {
+				if linesPrinted > 0 {
+					fmt.Fprint(w, clearLine)
+					if linesPrinted > 1 {
+						fmt.Fprint(w, moveUp+clearLine)
+					}
+					fmt.Fprint(w, "\r")
+				}
+				fmt.Fprintln(w, line1)
+				fmt.Fprint(w, line2)
+				linesPrinted = 2
+			})
 		}
 	}
 }
 
 func (app *cliApp) withInterrupt(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
+	if app.pause == nil {
+		app.pause = &outputPause{}
+	}
 	// Size 1: extra SIGINTs while we are not receiving are dropped instead of
 	// being queued as a fake "second Ctrl+C".
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	stopCh := make(chan struct{})
-	go watchSignals(cancel, sigCh, stopCh, app.err, app.exit)
+	go watchSignals(cancel, sigCh, stopCh, app.err, app.exit, interruptDebounce, app.pause)
 	var once sync.Once
 	return ctx, func() {
 		once.Do(func() {
@@ -624,26 +749,75 @@ func (app *cliApp) withInterrupt(parent context.Context) (context.Context, conte
 	}
 }
 
-func watchSignals(cancel context.CancelFunc, sig <-chan os.Signal, stop <-chan struct{}, out io.Writer, exit func(int)) {
+func watchSignals(cancel context.CancelFunc, sig <-chan os.Signal, stop <-chan struct{}, out io.Writer, exit func(int), debounce time.Duration, pause *outputPause) {
 	if exit == nil {
 		exit = os.Exit
 	}
+
+	var first os.Signal
+	select {
+	case <-stop:
+		return
+	case first = <-sig:
+	}
+
+	// SIGTERM is an explicit kill, not a typo. Cancel on the first one.
+	if first == syscall.SIGTERM {
+		pause.Print(out, "\nTerminated.")
+		cancel()
+		if swallowBounces(sig, stop, debounce) {
+			return
+		}
+		forceQuit(sig, stop, out, exit, pause)
+		return
+	}
+
+	pause.Print(out, "\nPress Ctrl+C again to exit.")
+	if swallowBounces(sig, stop, debounce) {
+		return
+	}
+
 	select {
 	case <-stop:
 		return
 	case <-sig:
 	}
-	fmt.Fprintln(out, "\nInterrupt received. Press Ctrl+C again to force quit.")
+	pause.Print(out, "Cancelling...")
 	cancel()
-	// One keypress can deliver a duplicate SIGINT (terminal/process-group bounce)
-	// while cancel() runs. Drain it so the first Ctrl+C is not treated as force-quit.
-	drainSignals(sig)
+	if swallowBounces(sig, stop, debounce) {
+		return
+	}
+	forceQuit(sig, stop, out, exit, pause)
+}
+
+func forceQuit(sig <-chan os.Signal, stop <-chan struct{}, out io.Writer, exit func(int), pause *outputPause) {
 	select {
 	case <-stop:
 		return
 	case <-sig:
-		fmt.Fprintln(out, "Forced quit.")
+		pause.Print(out, "Forced quit.")
 		exit(interruptExitCode)
+	}
+}
+
+// swallowBounces ignores signals for debounce so one keypress cannot count as
+// two. Returns true if stop was closed.
+func swallowBounces(sig <-chan os.Signal, stop <-chan struct{}, debounce time.Duration) bool {
+	if debounce <= 0 {
+		drainSignals(sig)
+		return false
+	}
+	timer := time.NewTimer(debounce)
+	defer timer.Stop()
+	for {
+		select {
+		case <-stop:
+			return true
+		case <-timer.C:
+			drainSignals(sig)
+			return false
+		case <-sig:
+		}
 	}
 }
 
@@ -666,25 +840,45 @@ func (app *cliApp) confirm(ctx context.Context, r *bufio.Reader, prompt string) 
 		line string
 		err  error
 	}
-	ch := make(chan reply, 1)
-	go func() {
-		line, err := r.ReadString('\n')
-		ch <- reply{line, err}
-	}()
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case res := <-ch:
-		// Ctrl+C can unblock stdin in the same moment the signal cancels ctx.
-		// Prefer the interrupt so a single SIGINT is not treated as "no" / EOF.
-		if err := ctx.Err(); err != nil {
-			return false, err
+	for {
+		ch := make(chan reply, 1)
+		go func() {
+			line, err := r.ReadString('\n')
+			ch <- reply{line, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case res := <-ch:
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if res.err != nil {
+				// Ctrl+C unblocks TTY reads on macOS (EINTR) without meaning
+				// "no". Keep the prompt up until a real answer or a second SIGINT.
+				if isInterruptedRead(res.err) {
+					fmt.Fprint(app.err, prompt)
+					continue
+				}
+				return false, res.err
+			}
+			return strings.TrimSpace(strings.ToLower(res.line)) == "y", nil
 		}
-		if res.err != nil {
-			return false, res.err
-		}
-		return strings.TrimSpace(strings.ToLower(res.line)) == "y", nil
 	}
+}
+
+func isInterruptedRead(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EINTR) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && errno == syscall.EINTR {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "interrupted system call")
 }
 
 func (app *cliApp) ifCancelled(err error) error {

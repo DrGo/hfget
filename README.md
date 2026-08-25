@@ -50,20 +50,26 @@ files in parallel, significantly speeding up the process.
 their expected size and SHA256 checksum (for LFS files) to ensure they are not 
 corrupted.
 * **Intelligent Syncing:** Only downloads files that are missing or have failed 
-local verification, saving time and bandwidth.
+local verification, saving time and bandwidth. Interrupted transfers are 
+resumed: partial files are kept, tagged with the remote size and checksum, 
+and only continued when that identity still matches. A mismatch starts over.
 * **Advanced Filtering:** Include or exclude specific files from a repository 
 using glob patterns.
 * **Robust Error Handling:** Features an idle timeout to prevent freezes on 
 stalled connections and retries on transient network errors. A single file 
 failure will not stop the entire download job.
 * **Accurate Progress Display:** Provides smooth, accurate progress bars for 
-both the initial file analysis and the download phases.
+both the initial file analysis and the download phases. If a transfer stops 
+making progress, the current-speed field is replaced with a short status 
+(for example `no internet` or `connection stalled`).
 * **Interactive & Scriptable:** Provides an interactive summary and 
 confirmation prompt for manual use. Use `-y` / `--yes` to skip the proceed 
 prompt while still showing progress; it does not force a re-download (use 
 `-f`). Prompts are also bypassed when not run in a terminal or when using 
-`--force` / `--quiet`. Press Ctrl+C once to cancel in-flight work, or twice 
-to force quit.
+`--force` / `--quiet`. Press Ctrl+C twice to quit: the first press pauses the 
+progress display and shows "Press Ctrl+C again to exit"; the second cancels 
+in-flight work and exits (partial files are kept so the next run can resume). 
+A third press force-quits if shutdown hangs.
 * **Flexible Layout:** By default files land in a flat `org_model` folder; 
 pass `--tree` to keep the Hugging Face layout as `org/model` (`repo/model_name`).
 * **Verbose Logging:** An optional `--verbose` flag provides detailed 

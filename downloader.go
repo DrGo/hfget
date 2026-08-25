@@ -255,11 +255,16 @@ func (d *Downloader) processFileForPlan(ctx context.Context, modelPath string, f
 		d.logger.Printf("File is already present and valid, skipping: %s", file.Path)
 		plan.FilesToSkip = append(plan.FilesToSkip, FileSkip{File: file, Reason: reason})
 		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, reason)
+		return
+	}
+	if d.hasResumablePartial(modelPath, file) {
+		reason = "resume"
+		d.logger.Printf("Planning resume of partial download for: %s", file.Path)
 	} else {
 		d.logger.Printf("File is missing or invalid (%s), planning download for: %s", reason, file.Path)
-		plan.FilesToDownload = append(plan.FilesToDownload, FileDownload{File: file, Reason: reason})
-		d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, reason)
 	}
+	plan.FilesToDownload = append(plan.FilesToDownload, FileDownload{File: file, Reason: reason})
+	d.sendProgress(file.Path, ProgressStateVerified, file.Size, file.Size, reason)
 }
 
 func (d *Downloader) ExecutePlan(ctx context.Context, plan *DownloadPlan) error {
@@ -342,6 +347,13 @@ func (d *Downloader) ensureWritableSpace(plan *DownloadPlan) error {
 		return nil
 	}
 	needed := requiredDownloadSpace(plan, d.numConnections)
+	if already := d.existingResumeBytes(plan); already > 0 {
+		if already >= needed {
+			needed = 0
+		} else {
+			needed -= already
+		}
+	}
 	d.logger.Printf("Writable space at %s: available %s, required %s", path, formatBytes(avail), formatBytes(needed))
 	return checkSpace(path, avail, needed)
 }
@@ -443,32 +455,28 @@ func (d *Downloader) shouldDownload(path string) bool {
 	return false
 }
 
-func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, tmpDir string, file HFFile) (string, error) {
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, chunkDir string, file HFFile, connections int) (string, error) {
+	if err := os.MkdirAll(chunkDir, 0o755); err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(tmpDir)
+	meta := d.newResumeMeta(file, resumeModeMulti, connections)
+	if err := writeResumeMeta(multiMetaPath(chunkDir), meta); err != nil {
+		return "", fmt.Errorf("failed to write resume metadata: %w", err)
+	}
 
 	var downloadedBytes atomic.Int64
-	chunkSize := file.Size / int64(d.numConnections)
 	var wg sync.WaitGroup
-	errChan := make(chan error, d.numConnections)
+	errChan := make(chan error, connections)
 
-	for i := range d.numConnections {
-		// FIX: Check context before spawning each chunk goroutine
+	for i := range connections {
 		if err := ctx.Err(); err != nil {
-			// Cancel remaining chunks by closing a local context or just returning
 			return "", fmt.Errorf("multi-threaded download cancelled: %w", err)
 		}
-		start := int64(i) * chunkSize
-		end := start + chunkSize - 1
-		if i == d.numConnections-1 {
-			end = file.Size - 1
-		}
+		start, end := chunkByteRange(file.Size, connections, i)
 		wg.Add(1)
 		go func(chunkIndex int, start, end int64) {
 			defer wg.Done()
-			tmpFileName := filepath.Join(tmpDir, fmt.Sprintf("%s_%d.tmp", filepath.Base(file.Path), chunkIndex))
+			tmpFileName := chunkTmpPath(chunkDir, chunkIndex)
 			if err := d.downloadChunk(ctx, url, tmpFileName, start, end, file, &downloadedBytes); err != nil {
 				errChan <- fmt.Errorf("chunk %d for %s failed: %w", chunkIndex, file.Path, err)
 			}
@@ -479,46 +487,96 @@ func (d *Downloader) downloadMultiThreaded(ctx context.Context, url, fullPath, t
 
 	for err := range errChan {
 		if err != nil {
-			return "", err // Return on first chunk error
+			return "", err
 		}
 	}
 
 	d.logger.Printf("All chunks downloaded for %s, merging files...", file.Path)
-	return mergeFiles(fullPath, tmpDir, filepath.Base(file.Path), d.numConnections, file, d.skipSHA)
+	checksum, err := mergeFiles(fullPath, chunkDir, connections, file, d.skipSHA)
+	if err != nil {
+		if file.LFS.IsLFS && !d.skipSHA && strings.Contains(err.Error(), "checksum mismatch") {
+			d.logger.Printf("Discarding partials for %s after checksum mismatch", file.Path)
+			removeChunkDir(chunkDir)
+		}
+		return "", err
+	}
+	removeChunkDir(chunkDir)
+	return checksum, nil
 }
 
 // downloadFile returns a calculated checksum (if available) and an error.
 func (d *Downloader) downloadFile(ctx context.Context, modelPath string, file HFFile) (string, error) {
+	fullPath := filepath.Join(modelPath, file.Path)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		return "", err
+	}
+	if d.forceRedownload {
+		d.discardPartials(modelPath, file)
+	}
+
+	useMulti := d.shouldUseMultiThread(modelPath, file)
+	if useMulti {
+		d.logger.Printf("Using multi-threaded download for %s", file.Path)
+	} else {
+		d.logger.Printf("Using single-threaded download for %s", file.Path)
+	}
+
+	// Mark the file active before network I/O so a hung connect is visible.
+	d.sendProgress(file.Path, ProgressStateDownloading, 0, file.Size, "connecting")
+
 	downloadURL, err := d.resolveDownloadURL(ctx, file)
 	if err != nil {
 		return "", err
 	}
 	d.logger.Printf("Resolved download URL for '%s': %s", file.Path, downloadURL)
 
-	fullPath := filepath.Join(modelPath, file.Path)
-	if err = os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-		return "", err
+	if useMulti {
+		d.discardSinglePartial(fullPath)
+		connections := d.numConnections
+		if n, stored := d.multiPartialSize(modelPath, file); n > 0 && stored > 0 {
+			connections = stored
+			d.logger.Printf("Resuming %s with %d connections from previous attempt", file.Path, connections)
+		} else {
+			d.discardMultiPartial(modelPath, file)
+		}
+		chunkDir := d.multiChunkDir(modelPath, file)
+		return d.downloadMultiThreaded(ctx, downloadURL, fullPath, chunkDir, file, connections)
 	}
 
-	// High-level branching logic is now much clearer.
-	if !file.LFS.IsLFS || file.Size < int64(d.numConnections*1024*1024) {
-		d.logger.Printf("Using single-threaded download for %s", file.Path)
-		return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
-	}
+	d.discardMultiPartial(modelPath, file)
+	return d.downloadSingleThreaded(ctx, downloadURL, fullPath, file)
+}
 
-	d.logger.Printf("Using multi-threaded download for %s (%d connections)", file.Path, d.numConnections)
-	tmpDir := filepath.Join(modelPath, ".tmp")
-	checksum, err := d.downloadMultiThreaded(ctx, downloadURL, fullPath, tmpDir, file)
-	// Return the checksum calculated during the merge phase
-	return checksum, err
+func (d *Downloader) shouldUseMultiThread(modelPath string, file HFFile) bool {
+	if n, _ := d.multiPartialSize(modelPath, file); n > 0 {
+		return true
+	}
+	if d.singlePartialSize(modelPath, file) > 0 {
+		return false
+	}
+	return file.LFS.IsLFS && file.Size >= int64(d.numConnections)*1024*1024
 }
 
 func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string, start, end int64, file HFFile, progressCounter *atomic.Int64) error {
+	want := end - start + 1
+	existing := fileSizeIfRegular(tmpFileName)
+	if existing > want {
+		d.logger.Printf("Discarding oversized chunk %s (%d > %d)", tmpFileName, existing, want)
+		_ = os.Remove(tmpFileName)
+		existing = 0
+	}
+	if existing == want {
+		progressCounter.Add(existing)
+		d.sendProgress(file.Path, ProgressStateDownloading, progressCounter.Load(), file.Size, "resume")
+		return nil
+	}
+
+	rangeStart := start + existing
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rangeStart, end))
 	if d.authToken != "" {
 		req.Header.Add("Authorization", "Bearer "+d.authToken)
 	}
@@ -528,10 +586,50 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
+	fullFile := start == 0 && end == file.Size-1
+	restart := existing == 0
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if crStart, ok := parseContentRangeStart(resp.Header.Get("Content-Range")); ok && crStart != rangeStart {
+			_ = os.Remove(tmpFileName)
+			return fmt.Errorf("unexpected Content-Range start %d for %s (wanted %d)", crStart, file.Path, rangeStart)
+		}
+	case http.StatusOK:
+		if !fullFile {
+			if existing > 0 {
+				_ = os.Remove(tmpFileName)
+			}
+			return fmt.Errorf("server ignored Range for chunk of %s", file.Path)
+		}
+		if existing > 0 {
+			d.logger.Printf("Server ignored Range for %s, restarting chunk", file.Path)
+			_ = os.Remove(tmpFileName)
+			existing = 0
+			restart = true
+		}
+	case http.StatusRequestedRangeNotSatisfiable:
+		_ = os.Remove(tmpFileName)
+		return fmt.Errorf("range not satisfiable for %s", file.Path)
+	default:
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
+		}
 	}
-	out, err := os.Create(tmpFileName)
+
+	if existing > 0 && !restart {
+		progressCounter.Add(existing)
+		d.sendProgress(file.Path, ProgressStateDownloading, progressCounter.Load(), file.Size, "resume")
+	}
+
+	var out *os.File
+	if restart || existing == 0 {
+		out, err = os.Create(tmpFileName)
+	} else {
+		out, err = os.OpenFile(tmpFileName, os.O_WRONLY, 0o644)
+		if err == nil {
+			_, err = out.Seek(existing, io.SeekStart)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -543,18 +641,49 @@ func (d *Downloader) downloadChunk(ctx context.Context, url, tmpFileName string,
 		totalSize:    file.Size,
 		w:            out,
 		d:            d,
-		bytesWritten: progressCounter, // Use the passed-in shared counter
+		bytesWritten: progressCounter,
 	}
 
 	_, err = io.Copy(progressWriter, idleReader)
 	return err
 }
 
-// downloadSingleThreaded now returns the calculated SHA256 checksum as a hex string.
 func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath string, file HFFile) (string, error) {
+	tmpPath := singleTmpPath(fullPath)
+	metaPath := singleMetaPath(fullPath)
+	meta := d.newResumeMeta(file, resumeModeSingle, 0)
+
+	existing := int64(0)
+	if loaded, err := loadResumeMeta(metaPath); err == nil && loaded.matches(d, file, resumeModeSingle) {
+		existing = fileSizeIfRegular(tmpPath)
+		if existing > file.Size {
+			d.logger.Printf("Discarding oversized partial for %s", file.Path)
+			d.discardSinglePartial(fullPath)
+			existing = 0
+		}
+	} else {
+		if existing = fileSizeIfRegular(tmpPath); existing > 0 {
+			d.logger.Printf("Discarding untagged or stale partial for %s", file.Path)
+		}
+		d.discardSinglePartial(fullPath)
+		existing = 0
+	}
+
+	if existing == file.Size && existing > 0 {
+		d.logger.Printf("Completing already-downloaded temp file for %s", file.Path)
+		return d.commitSingleTmp(tmpPath, metaPath, fullPath, file)
+	}
+
+	if existing > 0 {
+		d.logger.Printf("Resuming %s from offset %s", file.Path, formatBytes(existing))
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
+	}
+	if existing > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existing))
 	}
 	if d.authToken != "" {
 		req.Header.Add("Authorization", "Bearer "+d.authToken)
@@ -565,44 +694,102 @@ func (d *Downloader) downloadSingleThreaded(ctx context.Context, url, fullPath s
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	restart := existing == 0
+	switch {
+	case existing > 0 && resp.StatusCode == http.StatusPartialContent:
+		if crStart, ok := parseContentRangeStart(resp.Header.Get("Content-Range")); ok && crStart != existing {
+			d.discardSinglePartial(fullPath)
+			return "", fmt.Errorf("unexpected Content-Range start %d for %s (wanted %d)", crStart, file.Path, existing)
+		}
+	case existing > 0 && resp.StatusCode == http.StatusOK:
+		d.logger.Printf("Server ignored Range for %s, restarting download", file.Path)
+		d.discardSinglePartial(fullPath)
+		existing = 0
+		restart = true
+	case existing > 0 && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		d.discardSinglePartial(fullPath)
+		return "", fmt.Errorf("range not satisfiable for %s", file.Path)
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return "", fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
-	tmpPath := fullPath + ".tmp"
-	out, err := os.Create(tmpPath)
+
+	if err := writeResumeMeta(metaPath, meta); err != nil {
+		return "", fmt.Errorf("failed to write resume metadata: %w", err)
+	}
+
+	hasher := sha256.New()
+	if existing > 0 && !restart {
+		if err := hashFilePrefix(tmpPath, existing, hasher); err != nil {
+			return "", fmt.Errorf("failed to hash existing partial for %s: %w", file.Path, err)
+		}
+	}
+
+	var out *os.File
+	if restart || existing == 0 {
+		out, err = os.Create(tmpPath)
+	} else {
+		out, err = os.OpenFile(tmpPath, os.O_WRONLY, 0o644)
+		if err == nil {
+			_, err = out.Seek(existing, io.SeekStart)
+		}
+	}
 	if err != nil {
 		return "", err
 	}
 
 	var downloadedBytes atomic.Int64
+	downloadedBytes.Store(existing)
+	d.sendProgress(file.Path, ProgressStateDownloading, existing, file.Size, "resume")
+
 	idleReader := NewIdleTimeoutReader(ctx, resp.Body, 60*time.Second)
-
-	// Create a new hasher
-	hasher := sha256.New()
-	// Create a MultiWriter to write to both the file (out) and the hasher simultaneously.
 	writer := io.MultiWriter(out, hasher)
-
 	progressWriter := &progressWriter{
 		filepath:     file.Path,
 		totalSize:    file.Size,
-		w:            writer, // Use the MultiWriter as the destination
+		w:            writer,
 		d:            d,
 		bytesWritten: &downloadedBytes,
 	}
 
-	if _, err = io.Copy(progressWriter, idleReader); err != nil {
-		out.Close()
-		os.Remove(tmpPath)
+	_, err = io.Copy(progressWriter, idleReader)
+	closeErr := out.Close()
+	if err != nil {
 		return "", err
 	}
-	out.Close()
-	// Calculate the final checksum and return it.
+	if closeErr != nil {
+		return "", closeErr
+	}
+
+	got := fileSizeIfRegular(tmpPath)
+	if got != file.Size {
+		return "", fmt.Errorf("incomplete download for %s: got %d, want %d", file.Path, got, file.Size)
+	}
+
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
-	// Atomic rename
+	if file.LFS.IsLFS && !d.skipSHA && actualChecksum != file.LFS.Oid {
+		d.discardSinglePartial(fullPath)
+		return "", fmt.Errorf("checksum mismatch for %s: expected %s, got %s", file.Path, file.LFS.Oid, actualChecksum)
+	}
 	if err := os.Rename(tmpPath, fullPath); err != nil {
-		os.Remove(tmpPath)
 		return "", fmt.Errorf("failed to rename downloaded file: %w", err)
 	}
+	_ = os.Remove(metaPath)
+	return actualChecksum, nil
+}
+
+func (d *Downloader) commitSingleTmp(tmpPath, metaPath, fullPath string, file HFFile) (string, error) {
+	actualChecksum, err := sha256File(tmpPath)
+	if err != nil {
+		return "", err
+	}
+	if file.LFS.IsLFS && !d.skipSHA && actualChecksum != file.LFS.Oid {
+		d.discardSinglePartial(fullPath)
+		return "", fmt.Errorf("checksum mismatch for %s: expected %s, got %s", file.Path, file.LFS.Oid, actualChecksum)
+	}
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		return "", fmt.Errorf("failed to rename downloaded file: %w", err)
+	}
+	_ = os.Remove(metaPath)
 	return actualChecksum, nil
 }
 
@@ -629,19 +816,18 @@ func (d *Downloader) sendProgress(filepath string, state ProgressState, current,
 	}
 }
 
-func mergeFiles(outputFileName, tempDir, baseName string, numChunks int, file HFFile, skipSHA bool) (string, error) {
+func mergeFiles(outputFileName, chunkDir string, numChunks int, file HFFile, skipSHA bool) (string, error) {
 	tmpOutName := outputFileName + ".merge-tmp"
 	outputFile, err := os.Create(tmpOutName)
 	if err != nil {
 		return "", fmt.Errorf("failed to create merge temp file: %w", err)
 	}
 
-	// Create hasher and MultiWriter to calculate SHA256 on-the-fly
 	hasher := sha256.New()
 	writer := io.MultiWriter(outputFile, hasher)
 
 	for i := range numChunks {
-		tmpFileName := filepath.Join(tempDir, fmt.Sprintf("%s_%d.tmp", baseName, i))
+		tmpFileName := chunkTmpPath(chunkDir, i)
 		tmpFile, err := os.Open(tmpFileName)
 		if err != nil {
 			outputFile.Close()
@@ -656,23 +842,17 @@ func mergeFiles(outputFileName, tempDir, baseName string, numChunks int, file HF
 			return "", fmt.Errorf("failed to copy chunk %d: %w", i, err)
 		}
 		tmpFile.Close()
-
-		// Clean up the chunk file immediately after copying
-		_ = os.Remove(tmpFileName)
 	}
 
-	// CRITICAL: Close the file handle before renaming to prevent Windows file-lock errors
 	outputFile.Close()
 
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 
-	// Verify checksum before committing the file
 	if file.LFS.IsLFS && !skipSHA && actualChecksum != file.LFS.Oid {
 		os.Remove(tmpOutName)
 		return "", fmt.Errorf("checksum mismatch during merge: expected %s, got %s", file.LFS.Oid, actualChecksum)
 	}
 
-	// Atomic rename
 	if err := os.Rename(tmpOutName, outputFileName); err != nil {
 		os.Remove(tmpOutName)
 		return "", fmt.Errorf("failed to rename merged file: %w", err)

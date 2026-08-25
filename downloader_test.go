@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,8 +33,68 @@ type mockFile struct {
 	IsLFS                 bool
 }
 
-// setupMockServer now accepts a map of mock files to serve.
+type downloadSpy struct {
+	mu     sync.Mutex
+	ranges []string
+}
+
+func (s *downloadSpy) add(path, rng string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rng == "" {
+		s.ranges = append(s.ranges, path+":full")
+	} else {
+		s.ranges = append(s.ranges, path+":"+rng)
+	}
+}
+
+func (s *downloadSpy) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.ranges))
+	copy(out, s.ranges)
+	return out
+}
+
+func parseRangeHeader(header string, size int) (start, end int, ok bool) {
+	header = strings.TrimSpace(header)
+	if !strings.HasPrefix(header, "bytes=") {
+		return 0, 0, false
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	start, err := strconv.Atoi(parts[0])
+	if err != nil || start < 0 {
+		return 0, 0, false
+	}
+	if parts[1] == "" {
+		end = size - 1
+	} else {
+		end, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, 0, false
+		}
+	}
+	if start >= size || end < start {
+		return 0, 0, false
+	}
+	if end >= size {
+		end = size - 1
+	}
+	return start, end, true
+}
+
 func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
+	return setupMockServerTracked(t, files, nil)
+}
+
+func setupMockServerTracked(t *testing.T, files map[string]mockFile, spy *downloadSpy) *httptest.Server {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/tree/") {
@@ -76,28 +138,22 @@ func setupMockServer(t *testing.T, files map[string]mockFile) *httptest.Server {
 				return
 			}
 
-			// Check for Range header to handle chunked downloads
 			rangeHeader := r.Header.Get("Range")
 			if rangeHeader != "" {
-				var start, end int
-				_, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
-				if err != nil {
-					http.Error(w, "Invalid Range header", http.StatusBadRequest)
+				start, end, ok := parseRangeHeader(rangeHeader, len(f.Content))
+				if !ok {
+					http.Error(w, "Invalid Range header", http.StatusRequestedRangeNotSatisfiable)
 					return
 				}
-
-				if end >= len(f.Content) {
-					end = len(f.Content) - 1
-				}
-
+				spy.add(f.Path, rangeHeader)
 				contentRange := fmt.Sprintf("bytes %d-%d/%d", start, end, len(f.Content))
 				w.Header().Set("Content-Range", contentRange)
-				w.WriteHeader(http.StatusPartialContent) // Use 206 Partial Content status
+				w.WriteHeader(http.StatusPartialContent)
 				_, _ = w.Write([]byte(f.Content[start : end+1]))
 				return
 			}
 
-			// Fallback for full file downloads
+			spy.add(f.Path, "")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(f.Content))
 			return
@@ -253,7 +309,8 @@ func TestExecutePlan_ContinueOnError(t *testing.T) {
 
 	err = d.ExecutePlan(context.Background(), plan)
 	require.Error(err, "Expected ExecutePlan to return an error for checksum mismatch, but it didn't")
-	assert.True(strings.Contains(err.Error(), "validation failed for bad.bin"), "Expected error message to contain 'validation failed for bad.bin', but got: %v", err)
+	assert.True(strings.Contains(err.Error(), "bad.bin"), "Expected error to mention bad.bin, but got: %v", err)
+	assert.True(strings.Contains(err.Error(), "checksum mismatch"), "Expected checksum mismatch for bad.bin, but got: %v", err)
 
 	// But the good file should still have been downloaded correctly
 	repoPath := d.getModelPath(mockRepoID)
@@ -334,7 +391,7 @@ func TestProgressReporting_MultiThreaded(t *testing.T) {
 	progressChan := make(chan Progress, 100) // Buffered channel
 
 	// Use 5 connections to ensure multi-threading
-	d := New(mockRepoID, WithDestination(tmpDir), WithConnections(5), WithProgressChannel(progressChan))
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL), WithConnections(5), WithProgressChannel(progressChan))
 	info, err := d.FetchRepoInfo(context.Background())
 	require.NoError(err, "")
 	plan, err := d.BuildPlan(context.Background(), info)
@@ -445,7 +502,241 @@ func TestMultiThreadedMergeVerification(t *testing.T) {
 	finalPath := filepath.Join(repoPath, "large_merge.bin")
 	verifyFileContent(t, finalPath, largeContent)
 
-	// Ensure no .tmp files are left behind in the model directory
+	// Ensure no leftover temp files or .tmp dir in the model directory
 	matches, _ := filepath.Glob(filepath.Join(repoPath, "*.tmp"))
 	assert.True(len(matches) == 0, "Expected no .tmp files to be left behind, found: %v", matches)
+	_, err = os.Stat(filepath.Join(repoPath, ".tmp"))
+	assert.True(os.IsNotExist(err), "Expected .tmp directory to be removed after a successful merge")
+}
+
+func TestResumeSingleThreaded(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	content := strings.Repeat("r", 32*1024)
+	hasher := sha256.New()
+	hasher.Write([]byte(content))
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	mockFiles := map[string]mockFile{
+		"part.bin": {Path: "part.bin", Content: content, SHA256: sum, IsLFS: true},
+	}
+	spy := &downloadSpy{}
+	server := setupMockServerTracked(t, mockFiles, spy)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL), WithConnections(5))
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+	var remote HFFile
+	for _, f := range info.Siblings {
+		if f.Path == "part.bin" {
+			remote = f
+			break
+		}
+	}
+	require.True(remote.Path == "part.bin", "missing part.bin in repo info")
+
+	offset := int64(10 * 1024)
+	repoPath := d.getModelPath(mockRepoID)
+	require.NoError(os.MkdirAll(repoPath, 0o755), "")
+	fullPath := filepath.Join(repoPath, "part.bin")
+	require.NoError(os.WriteFile(singleTmpPath(fullPath), []byte(content[:offset]), 0o644), "")
+	require.NoError(writeResumeMeta(singleMetaPath(fullPath), d.newResumeMeta(remote, resumeModeSingle, 0)), "")
+
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+	require.Len(plan.FilesToDownload, 1, "expected one file to download")
+	assert.True(plan.FilesToDownload[0].Reason == "resume", "expected resume reason, got %s", plan.FilesToDownload[0].Reason)
+
+	err = d.ExecutePlan(context.Background(), plan)
+	require.NoError(err, "")
+	verifyFileContent(t, fullPath, content)
+
+	ranges := spy.snapshot()
+	require.True(len(ranges) >= 1, "expected a range request, got %v", ranges)
+	assert.True(strings.Contains(ranges[len(ranges)-1], fmt.Sprintf("bytes=%d-", offset)),
+		"expected resume from %d, got %v", offset, ranges)
+	_, err = os.Stat(singleTmpPath(fullPath))
+	assert.True(os.IsNotExist(err), "tmp file should be gone after success")
+}
+
+func TestResumeRejectsStalePartial(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	content := strings.Repeat("n", 16*1024)
+	hasher := sha256.New()
+	hasher.Write([]byte(content))
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	mockFiles := map[string]mockFile{
+		"stale.bin": {Path: "stale.bin", Content: content, SHA256: sum, IsLFS: true},
+	}
+	spy := &downloadSpy{}
+	server := setupMockServerTracked(t, mockFiles, spy)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+
+	repoPath := d.getModelPath(mockRepoID)
+	require.NoError(os.MkdirAll(repoPath, 0o755), "")
+	fullPath := filepath.Join(repoPath, "stale.bin")
+	require.NoError(os.WriteFile(singleTmpPath(fullPath), []byte("WRONG PREFIX!!!!"), 0o644), "")
+	stale := d.newResumeMeta(HFFile{Path: "stale.bin", Size: int64(len(content)), Oid: "old-oid", LFS: HFLFS{Oid: "old-sha"}}, resumeModeSingle, 0)
+	require.NoError(writeResumeMeta(singleMetaPath(fullPath), stale), "")
+
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+	assert.True(plan.FilesToDownload[0].Reason != "resume", "stale partial must not be treated as resumable, got %s", plan.FilesToDownload[0].Reason)
+
+	err = d.ExecutePlan(context.Background(), plan)
+	require.NoError(err, "")
+	verifyFileContent(t, fullPath, content)
+	assert.True(strings.Contains(strings.Join(spy.snapshot(), ","), ":full"),
+		"stale partial should trigger a full download, got %v", spy.snapshot())
+}
+
+func TestResumeMultiThreaded(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	largeContent := strings.Repeat("B", 6*1024*1024)
+	hasher := sha256.New()
+	hasher.Write([]byte(largeContent))
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	mockFiles := map[string]mockFile{
+		"big.bin": {Path: "big.bin", Content: largeContent, SHA256: sum, IsLFS: true},
+	}
+	spy := &downloadSpy{}
+	server := setupMockServerTracked(t, mockFiles, spy)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL), WithConnections(2))
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+	var remote HFFile
+	for _, f := range info.Siblings {
+		if f.Path == "big.bin" {
+			remote = f
+		}
+	}
+
+	chunkDir := d.multiChunkDir(d.getModelPath(mockRepoID), remote)
+	require.NoError(os.MkdirAll(chunkDir, 0o755), "")
+	start0, end0 := chunkByteRange(remote.Size, 2, 0)
+	start1, end1 := chunkByteRange(remote.Size, 2, 1)
+	require.NoError(os.WriteFile(chunkTmpPath(chunkDir, 0), []byte(largeContent[start0:end0+1]), 0o644), "")
+	partial := (end1 - start1 + 1) / 3
+	require.NoError(os.WriteFile(chunkTmpPath(chunkDir, 1), []byte(largeContent[start1:start1+partial]), 0o644), "")
+	require.NoError(writeResumeMeta(multiMetaPath(chunkDir), d.newResumeMeta(remote, resumeModeMulti, 2)), "")
+
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+	assert.True(plan.FilesToDownload[0].Reason == "resume", "expected resume, got %s", plan.FilesToDownload[0].Reason)
+
+	err = d.ExecutePlan(context.Background(), plan)
+	require.NoError(err, "")
+	verifyFileContent(t, filepath.Join(d.getModelPath(mockRepoID), "big.bin"), largeContent)
+
+	joined := strings.Join(spy.snapshot(), " | ")
+	assert.False(strings.Contains(joined, fmt.Sprintf("bytes=%d-%d", start0, end0)),
+		"complete chunk 0 should not be re-fetched, got %s", joined)
+	assert.True(strings.Contains(joined, fmt.Sprintf("bytes=%d-%d", start1+partial, end1)),
+		"chunk 1 should resume from %d, got %s", start1+partial, joined)
+}
+
+func TestInterruptedDownloadLeavesPartial(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	content := strings.Repeat("z", 64*1024)
+	hasher := sha256.New()
+	hasher.Write([]byte(content))
+	sum := hex.EncodeToString(hasher.Sum(nil))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tree/") {
+			body := fmt.Sprintf(`[{"type":"file","path":"cut.bin","size":%d,"oid":"%s","lfs":{"oid":"%s","size":%d}}]`,
+				len(content), sum, sum, len(content))
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/api/models/") {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"id":"%s","lastModified":"2023-01-01T00:00:00.000Z","siblings":[{"rfilename":"cut.bin"}]}`, mockRepoID)))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/resolve/") {
+			w.Header().Set("Location", "http://"+r.Host+"/download/cut.bin")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, content[:2048])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	}))
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+	err = d.ExecutePlan(context.Background(), plan)
+	require.Error(err, "expected truncated download to fail")
+
+	fullPath := filepath.Join(d.getModelPath(mockRepoID), "cut.bin")
+	st, statErr := os.Stat(singleTmpPath(fullPath))
+	require.NoError(statErr, "partial tmp should remain after interrupt")
+	assert.True(st.Size() > 0, "partial tmp should contain bytes")
+	_, metaErr := os.Stat(singleMetaPath(fullPath))
+	require.NoError(metaErr, "resume metadata should remain after interrupt")
+}
+
+func TestResumeCompleteTempFile(t *testing.T) {
+	require := testutils.NewRequire(t)
+
+	content := lfsFileContent
+	mockFiles := map[string]mockFile{
+		"lfs.bin": {Path: "lfs.bin", Content: content, SHA256: lfsFileSHA256, IsLFS: true},
+	}
+	spy := &downloadSpy{}
+	server := setupMockServerTracked(t, mockFiles, spy)
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	d := New(mockRepoID, WithDestination(tmpDir), WithBaseURL(server.URL))
+	info, err := d.FetchRepoInfo(context.Background())
+	require.NoError(err, "")
+	var remote HFFile
+	for _, f := range info.Siblings {
+		if f.Path == "lfs.bin" {
+			remote = f
+		}
+	}
+	fullPath := filepath.Join(d.getModelPath(mockRepoID), "lfs.bin")
+	require.NoError(os.MkdirAll(filepath.Dir(fullPath), 0o755), "")
+	require.NoError(os.WriteFile(singleTmpPath(fullPath), []byte(content), 0o644), "")
+	require.NoError(writeResumeMeta(singleMetaPath(fullPath), d.newResumeMeta(remote, resumeModeSingle, 0)), "")
+
+	plan, err := d.BuildPlan(context.Background(), info)
+	require.NoError(err, "")
+	err = d.ExecutePlan(context.Background(), plan)
+	require.NoError(err, "")
+	verifyFileContent(t, fullPath, content)
+	require.True(len(spy.snapshot()) == 0, "complete temp file should not re-fetch content, got %v", spy.snapshot())
 }

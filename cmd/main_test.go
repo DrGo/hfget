@@ -5,11 +5,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -464,8 +468,84 @@ func TestConfirmInterruptPrefersContext(t *testing.T) {
 	}
 }
 
+func TestConfirmRetriesInterruptedRead(t *testing.T) {
+	require := testutils.NewRequire(t)
+	assert := testutils.NewAssert(t)
+
+	r := bufio.NewReader(&eintrThenReader{rest: strings.NewReader("y\n")})
+	errOut := &bytes.Buffer{}
+	app := &cliApp{err: errOut}
+	ok, err := app.confirm(context.Background(), r, "Proceed? [y/N]: ")
+	require.NoError(err, "EINTR should retry, not fail confirm")
+	assert.True(ok, "expected yes after retry")
+	assert.True(strings.Count(errOut.String(), "Proceed? [y/N]: ") == 2, "expected prompt reprinted after interrupt, got: %s", errOut.String())
+}
+
+type eintrThenReader struct {
+	once bool
+	rest io.Reader
+}
+
+func (r *eintrThenReader) Read(p []byte) (int, error) {
+	if !r.once {
+		r.once = true
+		return 0, syscall.EINTR
+	}
+	return r.rest.Read(p)
+}
+
 func TestWatchSignals(t *testing.T) {
-	t.Run("first signal cancels without exiting", func(t *testing.T) {
+	const debounce = 30 * time.Millisecond
+
+	t.Run("first signal does not cancel or exit", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		errOut := &bytes.Buffer{}
+		exited := make(chan int, 1)
+
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, nil)
+		sig <- os.Interrupt
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("first signal should not cancel the context")
+		case code := <-exited:
+			t.Fatalf("first signal should not exit, got code %d", code)
+		case <-time.After(debounce + 40*time.Millisecond):
+		}
+		require.True(strings.Contains(errOut.String(), "Press Ctrl+C again to exit"), "Expected first-interrupt message, got: %s", errOut.String())
+		close(stop)
+	})
+
+	t.Run("first signal pauses output", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		errOut := &bytes.Buffer{}
+		pause := &outputPause{}
+		exited := make(chan int, 1)
+
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, pause)
+		sig <- os.Interrupt
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("first signal should not cancel the context")
+		case code := <-exited:
+			t.Fatalf("first signal should not exit, got code %d", code)
+		case <-time.After(debounce + 40*time.Millisecond):
+		}
+		require.True(pause.Paused(), "first signal should pause progress output")
+		require.True(strings.Contains(errOut.String(), "Press Ctrl+C again to exit"), "Expected first-interrupt message, got: %s", errOut.String())
+		close(stop)
+	})
+
+	t.Run("queued duplicate of first signal does not quit", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		assert := testutils.NewAssert(t)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -475,26 +555,24 @@ func TestWatchSignals(t *testing.T) {
 		errOut := &bytes.Buffer{}
 		exited := make(chan int, 1)
 
-		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
 		sig <- os.Interrupt
+		sig <- os.Interrupt
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, nil)
 
 		select {
 		case <-ctx.Done():
-		case <-time.After(time.Second):
-			t.Fatal("first signal did not cancel the context")
-		}
-		require.True(strings.Contains(errOut.String(), "Interrupt received"), "Expected first-interrupt message, got: %s", errOut.String())
-		assert.True(strings.Contains(errOut.String(), "Press Ctrl+C again to force quit"), "Expected force-quit hint, got: %s", errOut.String())
-
-		select {
+			t.Fatal("duplicate SIGINT from one keypress should not cancel")
 		case code := <-exited:
-			t.Fatalf("first signal should not force-exit, got code %d", code)
-		case <-time.After(30 * time.Millisecond):
+			t.Fatalf("duplicate SIGINT from one keypress should not exit, got code %d", code)
+		case <-time.After(debounce + 40*time.Millisecond):
 		}
+		require.True(strings.Contains(errOut.String(), "Press Ctrl+C again to exit"), "Expected first-interrupt message, got: %s", errOut.String())
+		assert.False(strings.Contains(errOut.String(), "Cancelling..."), "bounce should not cancel, got: %s", errOut.String())
+		assert.False(strings.Contains(errOut.String(), "Forced quit."), "bounce should not force-quit, got: %s", errOut.String())
 		close(stop)
 	})
 
-	t.Run("queued duplicate of first signal does not force-exit", func(t *testing.T) {
+	t.Run("second signal cancels without force-exit", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		assert := testutils.NewAssert(t)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -504,27 +582,28 @@ func TestWatchSignals(t *testing.T) {
 		errOut := &bytes.Buffer{}
 		exited := make(chan int, 1)
 
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, nil)
 		sig <- os.Interrupt
+		time.Sleep(debounce + 20*time.Millisecond)
 		sig <- os.Interrupt
-		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
 
 		select {
 		case <-ctx.Done():
 		case <-time.After(time.Second):
-			t.Fatal("first signal did not cancel the context")
+			t.Fatal("second signal did not cancel the context")
 		}
-		require.True(strings.Contains(errOut.String(), "Interrupt received"), "Expected first-interrupt message, got: %s", errOut.String())
+		require.True(strings.Contains(errOut.String(), "Cancelling..."), "Expected cancel message, got: %s", errOut.String())
 
 		select {
 		case code := <-exited:
-			t.Fatalf("duplicate SIGINT from one keypress should not force-exit, got code %d", code)
-		case <-time.After(50 * time.Millisecond):
+			t.Fatalf("second signal should cancel, not force-exit, got code %d", code)
+		case <-time.After(debounce + 20*time.Millisecond):
 		}
-		assert.False(strings.Contains(errOut.String(), "Forced quit."), "duplicate should not print forced-quit, got: %s", errOut.String())
+		assert.False(strings.Contains(errOut.String(), "Forced quit."), "second press should not force-quit, got: %s", errOut.String())
 		close(stop)
 	})
 
-	t.Run("second signal force exits", func(t *testing.T) {
+	t.Run("third signal force exits", func(t *testing.T) {
 		require := testutils.NewRequire(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -534,20 +613,221 @@ func TestWatchSignals(t *testing.T) {
 		errOut := &bytes.Buffer{}
 		exited := make(chan int, 1)
 
-		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code })
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, nil)
+		sig <- os.Interrupt
+		time.Sleep(debounce + 20*time.Millisecond)
 		sig <- os.Interrupt
 		<-ctx.Done()
-		// Let drainSignals drop any bounce from the first press before the
-		// real second Ctrl+C.
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(debounce + 20*time.Millisecond)
 		sig <- os.Interrupt
 
 		select {
 		case code := <-exited:
 			require.True(code == interruptExitCode, "Expected exit code %d, got %d", interruptExitCode, code)
 		case <-time.After(time.Second):
-			t.Fatal("second signal did not force-exit")
+			t.Fatal("third signal did not force-exit")
 		}
 		require.True(strings.Contains(errOut.String(), "Forced quit."), "Expected forced-quit message, got: %s", errOut.String())
 	})
+
+	t.Run("SIGTERM cancels on first signal", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sig := make(chan os.Signal, 2)
+		stop := make(chan struct{})
+		errOut := &bytes.Buffer{}
+		exited := make(chan int, 1)
+
+		go watchSignals(cancel, sig, stop, errOut, func(code int) { exited <- code }, debounce, nil)
+		sig <- syscall.SIGTERM
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("SIGTERM did not cancel the context")
+		}
+		require.True(strings.Contains(errOut.String(), "Terminated."), "Expected terminated message, got: %s", errOut.String())
+
+		select {
+		case code := <-exited:
+			t.Fatalf("first SIGTERM should not force-exit, got code %d", code)
+		case <-time.After(debounce + 20*time.Millisecond):
+		}
+		close(stop)
+	})
+}
+
+func TestProcessSIGINT(t *testing.T) {
+	if os.Getenv("HFGET_SIGINT_HELPER") != "" {
+		runSigintHelper()
+		return
+	}
+
+	t.Run("one SIGINT does not cancel", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		out, code := runSigintChild(t, "one")
+		require.True(code == 0, "child exit %d, output:\n%s", code, out)
+		require.True(strings.Contains(out, "STILL_ALIVE"), "expected child to stay alive, got:\n%s", out)
+		require.True(strings.Contains(out, "Press Ctrl+C again to exit"), "expected warning, got:\n%s", out)
+	})
+
+	t.Run("two SIGINTs cancel", func(t *testing.T) {
+		require := testutils.NewRequire(t)
+		out, code := runSigintChild(t, "two")
+		require.True(code == 2, "child exit %d, output:\n%s", code, out)
+		require.True(strings.Contains(out, "CANCELLED"), "expected cancel, got:\n%s", out)
+	})
+}
+
+func runSigintHelper() {
+	app := &cliApp{err: os.Stderr, exit: func(code int) {
+		fmt.Fprintf(os.Stderr, "FORCED %d\n", code)
+		os.Exit(code)
+	}}
+	ctx, stop := app.withInterrupt(context.Background())
+	defer stop()
+	select {
+	case <-ctx.Done():
+		fmt.Fprintln(os.Stderr, "CANCELLED")
+		os.Exit(2)
+	case <-time.After(800 * time.Millisecond):
+		fmt.Fprintln(os.Stderr, "STILL_ALIVE")
+		os.Exit(0)
+	}
+}
+
+func runSigintChild(t *testing.T, mode string) (string, int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProcessSIGINT$", "-test.v")
+	cmd.Env = append(os.Environ(), "HFGET_SIGINT_HELPER="+mode)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("first SIGINT: %v", err)
+	}
+	if mode == "two" {
+		time.Sleep(interruptDebounce + 50*time.Millisecond)
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			t.Fatalf("second SIGINT: %v", err)
+		}
+	}
+	err := cmd.Wait()
+	code := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else {
+			t.Fatalf("wait helper: %v", err)
+		}
+	}
+	return buf.String(), code
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func waitForOutput(t *testing.T, buf *lockedBuffer, needle string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), needle) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q in output %q", needle, buf.String())
+}
+
+func TestDownloadDisplayProgressPausesOnInterrupt(t *testing.T) {
+	require := testutils.NewRequire(t)
+	plan := &hfg.DownloadPlan{
+		TotalDownloadSize: 1000,
+		FilesToDownload: []hfg.FileDownload{
+			{File: hfg.HFFile{Path: "model.bin", Size: 1000}},
+		},
+	}
+	progress := make(chan hfg.Progress, 4)
+	var buf lockedBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pause := &outputPause{}
+	cfg := downloadProgressConfig{
+		tick:          15 * time.Millisecond,
+		diagnoseAfter: time.Hour,
+		stalledAfter:  time.Hour,
+		probeEvery:    time.Hour,
+		pause:         pause,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		downloadDisplayProgressWith(ctx, &buf, progress, 0, plan, cfg)
+	}()
+	progress <- hfg.Progress{
+		Filepath:    "model.bin",
+		State:       hfg.ProgressStateDownloading,
+		CurrentSize: 100,
+		TotalSize:   1000,
+	}
+	waitForOutput(t, &buf, "Overall:")
+
+	pause.Print(&buf, "\nPress Ctrl+C again to exit.")
+	frozen := buf.String()
+	time.Sleep(80 * time.Millisecond)
+	require.True(buf.String() == frozen, "progress output continued after pause:\nbefore %q\nafter %q", frozen, buf.String())
+	require.True(strings.Contains(frozen, "Press Ctrl+C again to exit"), "expected interrupt message to remain, got %q", frozen)
+
+	close(progress)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress display did not exit")
+	}
+}
+
+func TestAnalysisDisplayProgressPausesOnInterrupt(t *testing.T) {
+	require := testutils.NewRequire(t)
+	progress := make(chan hfg.Progress, 4)
+	var buf lockedBuffer
+	pause := &outputPause{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		analysisDisplayProgress(&buf, progress, 0, 1000, "dest", pause)
+	}()
+	progress <- hfg.Progress{Filepath: "a.bin", CurrentSize: 100, TotalSize: 1000}
+	waitForOutput(t, &buf, "Analyzing")
+
+	pause.Print(&buf, "\nPress Ctrl+C again to exit.")
+	frozen := buf.String()
+	time.Sleep(250 * time.Millisecond)
+	require.True(buf.String() == frozen, "analysis output continued after pause:\nbefore %q\nafter %q", frozen, buf.String())
+	require.True(strings.Contains(frozen, "Press Ctrl+C again to exit"), "expected interrupt message to remain, got %q", frozen)
+
+	close(progress)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("analysis display did not exit")
+	}
 }
